@@ -1,468 +1,721 @@
-#
-# Copyright (c) 2017 Intel Corporation
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#      http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
-#
+from __future__ import division
 
+import copy
+import numpy as np
+import pygame
 import random
-import sys
-from os import path, environ
+import time
+from skimage.transform import resize
+
+import carla
+
+from rl_coach.environments.carla.render import BirdeyeRender
+from rl_coach.environments.carla.route_planner import RoutePlanner
+from rl_coach.environments.carla.misc import *
+
+# Coach imports
 from rl_coach.logger import screen
 from rl_coach.filters.action.partial_discrete_action_space_map import PartialDiscreteActionSpaceMap
 from rl_coach.filters.observation.observation_rgb_to_y_filter import ObservationRGBToYFilter
 from rl_coach.filters.observation.observation_to_uint8_filter import ObservationToUInt8Filter
-
-try:
-    if 'CARLA_ROOT' in environ:
-        sys.path.append(path.join(environ.get('CARLA_ROOT'), 'PythonClient'))
-    else:
-        screen.error("CARLA_ROOT was not defined. Please set it to point to the CARLA root directory and try again.", crash=False)
-
-    from carla.client import CarlaClient
-    from carla.settings import CarlaSettings
-    from carla.tcp import TCPConnectionError
-    from carla.sensor import Camera
-    from carla.client import VehicleControl
-    from carla.planner.planner import Planner
-    from carla.driving_benchmark.experiment_suites.experiment_suite import ExperimentSuite
-except ImportError:
-    from rl_coach.logger import failed_imports
-    failed_imports.append("CARLA")
-
 import os
 import signal
 import logging
 import subprocess
-import numpy as np
 from rl_coach.environments.environment import Environment, EnvironmentParameters, LevelSelection
-from rl_coach.spaces import BoxActionSpace, ImageObservationSpace, StateSpace, VectorObservationSpace
+from rl_coach.spaces import BoxActionSpace, DiscreteActionSpace, ImageObservationSpace, StateSpace, VectorObservationSpace, PlanarMapsObservationSpace
 from rl_coach.utils import get_open_port, force_list
 from enum import Enum
 from typing import List, Union
 from rl_coach.base_parameters import VisualizationParameters
-from rl_coach.filters.filter import InputFilter, NoOutputFilter
+from rl_coach.filters.filter import NoInputFilter, NoOutputFilter
 from rl_coach.filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
 from rl_coach.filters.observation.observation_stacking_filter import ObservationStackingFilter
 
 
-# enum of the available levels and their path
-class CarlaLevel(Enum):
-    TOWN1 = {"map_name": "Town01", "map_path": "/Game/Maps/Town01"}
-    TOWN2 = {"map_name": "Town02", "map_path": "/Game/Maps/Town02"}
-
-
-key_map = {
-    'BRAKE': (274,),  # down arrow
-    'GAS': (273,),  # up arrow
-    'TURN_LEFT': (276,),  # left arrow
-    'TURN_RIGHT': (275,),  # right arrow
-    'GAS_AND_TURN_LEFT': (273, 276),
-    'GAS_AND_TURN_RIGHT': (273, 275),
-    'BRAKE_AND_TURN_LEFT': (274, 276),
-    'BRAKE_AND_TURN_RIGHT': (274, 275),
+CARLA_WEATHER_PRESETS = { # Added
+    0: carla.WeatherParameters.Default,
+    1: carla.WeatherParameters.ClearNoon,
+    2: carla.WeatherParameters.CloudyNoon,
+    3: carla.WeatherParameters.WetNoon,
+    4: carla.WeatherParameters.WetCloudyNoon,
+    5: carla.WeatherParameters.MidRainyNoon,
+    6: carla.WeatherParameters.HardRainNoon,
+    7: carla.WeatherParameters.SoftRainNoon,
+    8: carla.WeatherParameters.ClearSunset,
+    9: carla.WeatherParameters.CloudySunset,
+    10: carla.WeatherParameters.WetSunset,
+    11: carla.WeatherParameters.WetCloudySunset,
+    12: carla.WeatherParameters.MidRainSunset,
+    13: carla.WeatherParameters.HardRainSunset,
+    14: carla.WeatherParameters.SoftRainSunset
 }
 
-CarlaInputFilter = InputFilter(is_a_reference_filter=True)
-CarlaInputFilter.add_observation_filter('forward_camera', 'rescaling',
-                                        ObservationRescaleToSizeFilter(ImageObservationSpace(np.array([128, 180, 3]),
-                                                                                             high=255)))
-CarlaInputFilter.add_observation_filter('forward_camera', 'to_grayscale', ObservationRGBToYFilter())
-CarlaInputFilter.add_observation_filter('forward_camera', 'to_uint8', ObservationToUInt8Filter(0, 255))
-CarlaInputFilter.add_observation_filter('forward_camera', 'stacking', ObservationStackingFilter(4))
-
+# Set up the input and output filters
+# Input filters apply operations to the input space defined, several input filters can be defined. The order is executed sequentially
+# Output filters apply operations on the output space defined.
+CarlaInputFilter = NoInputFilter()
 CarlaOutputFilter = NoOutputFilter()
 
-
-class CameraTypes(Enum):
-    FRONT = "forward_camera"
-    LEFT = "left_camera"
-    RIGHT = "right_camera"
-    SEGMENTATION = "segmentation"
-    DEPTH = "depth"
+class SensorTypes(Enum):
+    FRONT_CAMERA = "forward_camera"
     LIDAR = "lidar"
-
+    BIRDEYE = "birdeye"
 
 class CarlaEnvironmentParameters(EnvironmentParameters):
-    class Quality(Enum):
-        LOW = "Low"
-        EPIC = "Epic"
+    def __init__(self):
+        super().__init__()
+        self.host = 'localhost'
+        self.port = 2000
+        self.timeout = 10.0 # Carla client timeout
+        self.level = 'Town03' # Name of the world
+        self.number_of_vehicles = 10
+        self.number_of_walkers = 0
+        self.weather_id = 1 # Weather IDs: https://carla.readthedocs.io/en/stable/carla_settings/
 
-    def __init__(self, level="town1"):
-        super().__init__(level=level)
-        self.frame_skip = 3  # the frame skip affects the fps of the server directly. fps = 30 / frameskip
-        self.server_height = 512
-        self.server_width = 720
-        self.camera_height = 128
-        self.camera_width = 180
-        self.experiment_suite = None  # an optional CARLA experiment suite to use
-        self.config = None
-        self.level = level
-        self.quality = self.Quality.LOW
-        self.cameras = [CameraTypes.FRONT]
-        self.weather_id = [1]
-        self.verbose = True
-        self.episode_max_time = 100000  # miliseconds for each episode
-        self.allow_braking = False
-        self.separate_actions_for_throttle_and_brake = False
-        self.num_speedup_steps = 30
-        self.max_speed = 35.0  # km/h
+        self.frame_skip = 1 # number of frames to repeat the same action
+
+        self.ego_vehicle_filter = 'vehicle.lincoln*' # filter for defining ego vehicle
+        self.display_size = 256 # screen size of bird-eye render
+        self.display_route = True # whether to render the desired route
+        self.render_pygame = True # whether to render the pygame window
+        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR] # defines list of sensor for the state space
+        self.camera_height = 256
+        self.camera_width = 256
+        self.obs_range = 32 # observation range (meter)
+        self.lidar_bin = 0.125 # bin size of lidar sensor (meter)
+        self.d_behind = 12 # distance behind the ego vehicle (meter)
+        self.out_lane_thres = 2.0 # threshold for out of lane
+        self.desired_speed = 8 # desired speed (m/s)
+
+        self.discrete = True # whether to use discrete control space
+        self.discrete_acc = [-3.0, 0.0, 3.0] # discrete value of accelerations
+        self.discrete_steer = [-0.2, 0.0, 0.2] # discrete value of steering angles
+        self.continuous_accel_range = [-3.0, 3.0]  # continuous acceleration range
+        self.continuous_steer_range = [-0.3, 0.3]  # continuous steering angle range
+
+        self.max_past_step = 1 # the number of past steps to draw
+        self.dt = 0.1  # time interval between two frames
+        self.max_ego_spawn_times = 200 # maximum times to spawn ego vehicle
+        self.max_time_episode = 1000 # maximum `timestep`s per episode
+        self.max_waypt = 12 # maximum number of waypoints
+
         self.default_input_filter = CarlaInputFilter
         self.default_output_filter = CarlaOutputFilter
 
     @property
     def path(self):
-        return 'rl_coach.environments.carla_environment:CarlaEnvironment'
-
+        return 'rl_coach.environments.carla_coach_env:CarlaEnvironment'
 
 class CarlaEnvironment(Environment):
+    """A coach wrapper for CARLA simulator."""
     def __init__(self, level: LevelSelection,
-                 seed: int, frame_skip: int, human_control: bool, custom_reward_threshold: Union[int, float],
-                 visualization_parameters: VisualizationParameters,
-                 server_height: int, server_width: int, camera_height: int, camera_width: int,
-                 verbose: bool, experiment_suite: ExperimentSuite, config: str, episode_max_time: int,
-                 allow_braking: bool, quality: CarlaEnvironmentParameters.Quality,
-                 cameras: List[CameraTypes], weather_id: List[int], experiment_path: str,
-                 separate_actions_for_throttle_and_brake: bool,
-                 num_speedup_steps: int, max_speed: float, target_success_rate: float = 1.0, **kwargs):
-        super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters, target_success_rate)
+               seed: int, frame_skip: int, human_control: bool, custom_reward_threshold: Union[int, float],
+               visualization_parameters: VisualizationParameters,
+               host: str, port: int, timeout: float,
+               number_of_vehicles: int, number_of_walkers: int, weather_id: int,
+               ego_vehicle_filter: str, display_size: int,
+               sensors: List[SensorTypes], camera_height: int, camera_width: int,
+               lidar_bin: float, obs_range: float, display_route: bool, render_pygame: bool,
+               d_behind: float, out_lane_thres: float, desired_speed: float, max_past_step: int,
+               dt: float, discrete: bool, discrete_acc: List[float], discrete_steer: List[float],
+               continuous_accel_range: List[float], continuous_steer_range: List[float],
+               max_ego_spawn_times: int, max_time_episode: int, max_waypt: int, **kwargs):
+        super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
 
-        # server configuration
-        self.server_height = server_height
-        self.server_width = server_width
-        self.port = get_open_port()
-        self.host = 'localhost'
-        self.map_name = CarlaLevel[level.upper()].value['map_name']
-        self.map_path = CarlaLevel[level.upper()].value['map_path']
-        self.experiment_path = experiment_path
+        self.level = level
+        # self.frame_skip = frame_skip
+        # self.seed = seed
+        # self.human_control = human_control
+        # self.custom_reward_threshold = custom_reward_threshold
+        # self.visualization_paramters = visualization_parameters
 
-        # client configuration
-        self.verbose = verbose
-        self.quality = quality
-        self.cameras = cameras
+        self.host = host
+        self.port = port
+        self.timeout = timeout
+        self.number_of_vehicles = number_of_vehicles
+        self.number_of_walkers = number_of_walkers
         self.weather_id = weather_id
-        self.episode_max_time = episode_max_time
-        self.allow_braking = allow_braking
-        self.separate_actions_for_throttle_and_brake = separate_actions_for_throttle_and_brake
-        self.camera_width = camera_width
+
+        self.ego_vehicle_filter = ego_vehicle_filter
+        self.display_size = display_size
+        self.sensors = sensors
         self.camera_height = camera_height
+        self.camera_width = camera_width
+        self.obs_range = obs_range
+        self.lidar_bin = lidar_bin
+        self.obs_size = int(self.obs_range/self.lidar_bin)
+        self.display_route = display_route
+        self.render_pygame = render_pygame
+        self.d_behind = d_behind
+        self.out_lane_thres = out_lane_thres
+        self.desired_speed = desired_speed
 
-        # setup server settings
-        self.experiment_suite = experiment_suite
-        self.config = config
-        if self.config:
-            # load settings from file
-            with open(self.config, 'r') as fp:
-                self.settings = fp.read()
+        self.max_past_step = max_past_step
+        self.dt = dt
+        self.discrete = discrete
+        self.discrete_acc = discrete_acc
+        self.discrete_steer = discrete_steer
+        self.continuous_accel_range = continuous_accel_range
+        self.continuous_steer_range = continuous_steer_range
+        self.max_ego_spawn_times = max_ego_spawn_times
+        self.max_time_episode = max_time_episode
+        self.max_waypt = max_waypt
+
+        # Connect to carla server and get world object
+        print('connecting to Carla server...')
+        self.client = carla.Client(self.host, self.port)
+        self.client.set_timeout(self.timeout)
+        self.traffic_manager = self.client.get_trafficmanager()
+        self.world = self.client.load_world(level)
+        print('Carla server connected!')
+
+        # Set weather
+        self.world.set_weather(CARLA_WEATHER_PRESETS[self.weather_id])
+
+        # Get spawn points
+        self._get_spawn_points()
+
+        # Create the ego vehicle blueprint
+        self.ego_bp = self._create_vehicle_bluepprint(self.ego_vehicle_filter, color='49,8,8')
+
+        # Collision sensor
+        self.collision_hist = [] # The collision history
+        self.collision_hist_l = 1 # collision history length
+        self.collision_bp = self.world.get_blueprint_library().find('sensor.other.collision')
+
+        # Lidar sensor
+        self.lidar_data = None
+        self.lidar_height = 2.1
+        self.lidar_trans = carla.Transform(carla.Location(x=0.0, z=self.lidar_height))
+        self.lidar_bp = self.world.get_blueprint_library().find('sensor.lidar.ray_cast')
+        self.lidar_bp.set_attribute('channels', '32')
+        self.lidar_bp.set_attribute('range', '5000')
+
+        # Camera sensor
+        self.camera_img = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
+        self.camera_trans = carla.Transform(carla.Location(x=0.8, z=1.7))
+        self.camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+        # Modify the attributes of the blueprint to set image resolution and field of view.
+        self.camera_bp.set_attribute('image_size_x', str(self.camera_width))
+        self.camera_bp.set_attribute('image_size_y', str(self.camera_height))
+        self.camera_bp.set_attribute('fov', '110')
+        # Set the time in seconds between sensor captures
+        self.camera_bp.set_attribute('sensor_tick', '0.02')
+
+        # Set fixed simulation step for synchronous mode
+        self.settings = self.world.get_settings()
+        self.settings.fixed_delta_seconds = self.dt
+
+        # Record the time of total steps and resetting steps
+        self.reset_step = 0
+        self.total_step = 0
+
+        # Action space
+        if self.discrete:
+            self.discrete_act = [discrete_acc, discrete_steer]
+            self.n_acc = len(self.discrete_act[0])
+            self.n_steer = len(self.discrete_act[1])
+            self.action_space = DiscreteActionSpace(num_actions=self.n_acc*self.n_steer, descriptions=["acceleration", "steering"])
         else:
-            # hard coded settings
-            self.settings = CarlaSettings()
-            self.settings.set(
-                SynchronousMode=True,
-                SendNonPlayerAgentsInfo=False,
-                NumberOfVehicles=15,
-                NumberOfPedestrians=30,
-                WeatherId=random.choice(force_list(self.weather_id)),
-                QualityLevel=self.quality.value,
-                SeedVehicles=seed,
-                SeedPedestrians=seed)
-            if seed is None:
-                self.settings.randomize_seeds()
+            self.action_space = BoxActionSpace(shape=2, low=np.array([continuous_accel_range[0], continuous_steer_range[0]]),
+            high=np.array([continuous_accel_range[1], continuous_steer_range[1]]), descriptions=["acceleration", "steering"])
 
-            self.settings = self._add_cameras(self.settings, self.cameras, self.camera_width, self.camera_height)
-
-        # open the server
-        self.server = self._open_server()
-
-        logging.disable(40)
-
-        # open the client
-        self.game = CarlaClient(self.host, self.port, timeout=99999999)
-        self.game.connect()
-        if self.experiment_suite:
-            self.current_experiment_idx = 0
-            self.current_experiment = self.experiment_suite.get_experiments()[self.current_experiment_idx]
-            self.scene = self.game.load_settings(self.current_experiment.conditions)
-        else:
-            self.scene = self.game.load_settings(self.settings)
-
-        # get available start positions
-        self.positions = self.scene.player_start_spots
-        self.num_positions = len(self.positions)
-        self.current_start_position_idx = 0
-        self.current_pose = 0
-
-        # state space
+        # Observation space
         self.state_space = StateSpace({
-            "measurements": VectorObservationSpace(4, measurements_names=["forward_speed", "x", "y", "z"])
+            "measurements": VectorObservationSpace(shape=4, low=np.array([-2, -1, -5, 0]), high=np.array([2, 1, 30, 1]),
+                                                    measurements_names=["lat_dist", "heading_error", "ego_speed", "safety_margin"])
         })
-        for camera in self.scene.sensors:
-            self.state_space[camera.name] = ImageObservationSpace(
-                shape=np.array([self.camera_height, self.camera_width, 3]),
-                high=255)
 
-        # action space
-        if self.separate_actions_for_throttle_and_brake:
-            self.action_space = BoxActionSpace(shape=3, low=np.array([-1, 0, 0]), high=np.array([1, 1, 1]),
-                                               descriptions=["steer", "gas", "brake"])
-        else:
-            self.action_space = BoxActionSpace(shape=2, low=np.array([-1, -1]), high=np.array([1, 1]),
-                                               descriptions=["steer", "gas_and_brake"])
+        if SensorTypes.FRONT_CAMERA in self.sensors:
+            #self._add_camera()
+            self.state_space[SensorTypes.FRONT_CAMERA.value] = ImageObservationSpace(shape=np.array([self.camera_height, self.camera_width, 3]), high=255)
+        if SensorTypes.LIDAR in self.sensors:
+            #self._add_lidar()
+            # @TODO: CHECK IF IT IS BETTER TO USE AN IMAGEOOBSERVATIONSPACE OBJECT
+            self.state_space[SensorTypes.LIDAR.value] = PlanarMapsObservationSpace(shape=np.array([self.obs_size, self.obs_size, 3]), low=0, high=255)
+        if SensorTypes.BIRDEYE in self.sensors:
+            self.state_space[SensorTypes.BIRDEYE.value] = ImageObservationSpace(shape=np.array([self.obs_size, self.obs_size, 3]), high=255)
 
-        # human control
-        if self.human_control:
-            # convert continuous action space to discrete
-            self.steering_strength = 0.5
-            self.gas_strength = 1.0
-            self.brake_strength = 0.5
-            # TODO: reverse order of actions
-            self.action_space = PartialDiscreteActionSpaceMap(
-                target_actions=[[0., 0.],
-                                [0., -self.steering_strength],
-                                [0., self.steering_strength],
-                                [self.gas_strength, 0.],
-                                [-self.brake_strength, 0],
-                                [self.gas_strength, -self.steering_strength],
-                                [self.gas_strength, self.steering_strength],
-                                [self.brake_strength, -self.steering_strength],
-                                [self.brake_strength, self.steering_strength]],
-                descriptions=['NO-OP', 'TURN_LEFT', 'TURN_RIGHT', 'GAS', 'BRAKE',
-                              'GAS_AND_TURN_LEFT', 'GAS_AND_TURN_RIGHT',
-                              'BRAKE_AND_TURN_LEFT', 'BRAKE_AND_TURN_RIGHT']
-            )
+        # Initialize the renderer
+        self._init_renderer()
 
-            # map keyboard keys to actions
-            for idx, action in enumerate(self.action_space.descriptions):
-                for key in key_map.keys():
-                    if action == key:
-                        self.key_to_action[key_map[key]] = idx
-
-        self.num_speedup_steps = num_speedup_steps
-        self.max_speed = max_speed
-
-        # measurements
-        self.autopilot = None
-        self.planner = Planner(self.map_name)
-
-        # env initialization
         self.reset_internal_state(True)
 
-        # render
-        if self.is_rendered:
-            image = self.get_rendered_image()
-            self.renderer.create_screen(image.shape[1], image.shape[0])
-
-        self.target_success_rate = target_success_rate
-
-    def _add_cameras(self, settings, cameras, camera_width, camera_height):
-        # add a front facing camera
-        if CameraTypes.FRONT in cameras:
-            camera = Camera(CameraTypes.FRONT.value)
-            camera.set(FOV=100)
-            camera.set_image_size(camera_width, camera_height)
-            camera.set_position(2.0, 0, 1.4)
-            camera.set_rotation(-15.0, 0, 0)
-            settings.add_sensor(camera)
-
-        # add a left facing camera
-        if CameraTypes.LEFT in cameras:
-            camera = Camera(CameraTypes.LEFT.value)
-            camera.set(FOV=100)
-            camera.set_image_size(camera_width, camera_height)
-            camera.set_position(2.0, 0, 1.4)
-            camera.set_rotation(-15.0, -30, 0)
-            settings.add_sensor(camera)
-
-        # add a right facing camera
-        if CameraTypes.RIGHT in cameras:
-            camera = Camera(CameraTypes.RIGHT.value)
-            camera.set(FOV=100)
-            camera.set_image_size(camera_width, camera_height)
-            camera.set_position(2.0, 0, 1.4)
-            camera.set_rotation(-15.0, 30, 0)
-            settings.add_sensor(camera)
-
-        # add a front facing depth camera
-        if CameraTypes.DEPTH in cameras:
-            camera = Camera(CameraTypes.DEPTH.value)
-            camera.set_image_size(camera_width, camera_height)
-            camera.set_position(0.2, 0, 1.3)
-            camera.set_rotation(8, 30, 0)
-            camera.PostProcessing = 'Depth'
-            settings.add_sensor(camera)
-
-        # add a front facing semantic segmentation camera
-        if CameraTypes.SEGMENTATION in cameras:
-            camera = Camera(CameraTypes.SEGMENTATION.value)
-            camera.set_image_size(camera_width, camera_height)
-            camera.set_position(0.2, 0, 1.3)
-            camera.set_rotation(8, 30, 0)
-            camera.PostProcessing = 'SemanticSegmentation'
-            settings.add_sensor(camera)
-
-        return settings
-
-    def _get_directions(self, current_point, end_point):
-        """
-        Class that should return the directions to reach a certain goal
-        """
-
-        directions = self.planner.get_next_command(
-            (current_point.location.x,
-             current_point.location.y, 0.22),
-            (current_point.orientation.x,
-             current_point.orientation.y,
-             current_point.orientation.z),
-            (end_point.location.x, end_point.location.y, 0.22),
-            (end_point.orientation.x, end_point.orientation.y, end_point.orientation.z))
-        return directions
-
-    def _open_server(self):
-        log_path = path.join(self.experiment_path if self.experiment_path is not None else '.', 'logs',
-                             "CARLA_LOG_{}.txt".format(self.port))
-        if not os.path.exists(os.path.dirname(log_path)):
-            os.makedirs(os.path.dirname(log_path))
-        with open(log_path, "wb") as out:
-            cmd = [path.join(environ.get('CARLA_ROOT'), 'CarlaUE4.sh'), self.map_path,
-                   "-benchmark", "-carla-server", "-fps={}".format(30 / self.frame_skip),
-                   "-world-port={}".format(self.port),
-                   "-windowed -ResX={} -ResY={}".format(self.server_width, self.server_height),
-                   "-carla-no-hud"]
-
-            if self.config:
-                cmd.append("-carla-settings={}".format(self.config))
-            p = subprocess.Popen(cmd, stdout=out, stderr=out)
-
-        return p
-
-    def _close_server(self):
-        os.killpg(os.getpgid(self.server.pid), signal.SIGKILL)
-
     def _update_state(self):
-        # get measurements and observations
-        measurements = []
-        while type(measurements) == list:
-            measurements, sensor_data = self.game.read_data()
+        """ Update the internal state of the wrapper
+        self.state - a dictionary containing all the observations from the environment and follows the state_space definition
+        self.reward - float value containing the reward for the last step of the environment
+        self.done - boolean flag which signals if the environment episode has ended
+        self.goal - numpy array representing the goal the environment has set for the last step
+        self.info - dictionary that contains any additional information for the last step
+        """
+
         self.state = {}
+        self.reward = None
+        self.done = None
 
-        for camera in self.scene.sensors:
-            self.state[camera.name] = sensor_data[camera.name].data
+        # Append actors polygon list
+        vehicle_poly_dict = self._get_actor_polygons('vehicle.*')
+        self.vehicle_polygons.append(vehicle_poly_dict)
+        while len(self.vehicle_polygons) > self.max_past_step:
+          self.vehicle_polygons.pop(0)
+        walker_poly_dict = self._get_actor_polygons('walker.*')
+        self.walker_polygons.append(walker_poly_dict)
+        while len(self.walker_polygons) > self.max_past_step:
+          self.walker_polygons.pop(0)
 
-        self.location = [measurements.player_measurements.transform.location.x,
-                         measurements.player_measurements.transform.location.y,
-                         measurements.player_measurements.transform.location.z]
+        # route planner
+        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
 
-        self.distance_from_goal = np.linalg.norm(np.array(self.location[:2]) -
-                                                 [self.current_goal.location.x, self.current_goal.location.y])
+        # state information
+        info = {
+          'waypoints': self.waypoints,
+          'vehicle_front': self.vehicle_front
+        }
 
-        is_collision = measurements.player_measurements.collision_vehicles != 0 \
-                       or measurements.player_measurements.collision_pedestrians != 0 \
-                       or measurements.player_measurements.collision_other != 0
+        # Update timesteps
+        self.time_step += 1
+        self.total_step += 1
 
-        speed_reward = measurements.player_measurements.forward_speed - 1
-        if speed_reward > 30.:
-            speed_reward = 30.
-        self.reward = speed_reward \
-                      - (measurements.player_measurements.intersection_otherlane * 5) \
-                      - (measurements.player_measurements.intersection_offroad * 5) \
-                      - is_collision * 100 \
-                      - np.abs(self.control.steer) * 10
-
-        # update measurements
-        self.measurements = [measurements.player_measurements.forward_speed] + self.location
-        self.autopilot = measurements.player_measurements.autopilot_control
-
-        # The directions to reach the goal (0 Follow lane, 1 Left, 2 Right, 3 Straight)
-        directions = int(self._get_directions(measurements.player_measurements.transform, self.current_goal) - 2)
-        self.state['high_level_command'] = directions
-
-        if (measurements.game_timestamp >= self.episode_max_time) or is_collision:
-            self.done = True
-
-        self.state['measurements'] = np.array(self.measurements)
+        self.state = self._get_obs()
+        self.reward = self._get_reward()
+        self.done = self._terminal()
+        self.info = copy.deepcopy(info)
 
     def _take_action(self, action):
-        self.control = VehicleControl()
-
-        if self.separate_actions_for_throttle_and_brake:
-            self.control.steer = np.clip(action[0], -1, 1)
-            self.control.throttle = np.clip(action[1], 0, 1)
-            self.control.brake = np.clip(action[2], 0, 1)
+        """ Gets the action from the agent and makes a single step on the environment """
+        # Calculate acceleration and steering
+        if self.discrete:
+            acc = self.discrete_act[0][action//self.n_steer]
+            steer = self.discrete_act[1][action%self.n_steer]
         else:
-            # transform the 2 value action (steer, throttle - brake) into a 3 value action (steer, throttle, brake)
-            self.control.steer = np.clip(action[0], -1, 1)
-            self.control.throttle = np.clip(action[1], 0, 1)
-            self.control.brake = np.abs(np.clip(action[1], -1, 0))
+            acc = action[0]
+            steer = action[1]
 
-        # prevent braking
-        if not self.allow_braking or self.control.brake < 0.1 or self.control.throttle > self.control.brake:
-            self.control.brake = 0
+        # Convert acceleration to throttle and brake
+        if acc > 0:
+            throttle = np.clip(acc/3,0,1)
+            brake = 0
+        else:
+            throttle = 0
+            brake = np.clip(-acc/8,0,1)
 
-        # prevent over speeding
-        if hasattr(self, 'measurements') and self.measurements[0] * 3.6 > self.max_speed and self.control.brake == 0:
-            self.control.throttle = 0.0
+        # Apply control
+        act = carla.VehicleControl(throttle=float(throttle), steer=float(-steer), brake=float(brake))
+        self.ego.apply_control(act)
 
-        self.control.hand_brake = False
-        self.control.reverse = False
-
-        self.game.send_control(self.control)
-
-    def _load_experiment(self, experiment_idx):
-        self.current_experiment = self.experiment_suite.get_experiments()[experiment_idx]
-        self.scene = self.game.load_settings(self.current_experiment.conditions)
-        self.positions = self.scene.player_start_spots
-        self.num_positions = len(self.positions)
-        self.current_start_position_idx = 0
-        self.current_pose = 0
+        self.world.tick()
 
     def _restart_environment_episode(self, force_environment_reset=False):
-        # select start and end positions
-        if self.experiment_suite:
-            # if an expeirent suite is available, follow its given poses
-            if self.current_pose >= len(self.current_experiment.poses):
-                # load a new experiment
-                self.current_experiment_idx = (self.current_experiment_idx + 1) % len(self.experiment_suite.get_experiments())
-                self._load_experiment(self.current_experiment_idx)
+        """ Restart the environment on a new episode """
+        # Clear sensor objects
+        self.collision_sensor = None
+        self.lidar_sensor = None
+        self.camera_sensor = None
 
-            self.current_start_position_idx = self.current_experiment.poses[self.current_pose][0]
-            self.current_goal = self.positions[self.current_experiment.poses[self.current_pose][1]]
-            self.current_pose += 1
-        else:
-            # go over all the possible positions in a cyclic manner
-            self.current_start_position_idx = (self.current_start_position_idx + 1) % self.num_positions
+        # Delete sensors, vehicles and walkers
+        self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'vehicle.*', 'controller.ai.walker', 'walker.*'])
 
-            # choose a random goal destination
-            self.current_goal = random.choice(self.positions)
+        # Disable sync mode
+        self._set_synchronous_mode(False)
 
-        try:
-            self.game.start_episode(self.current_start_position_idx)
-        except:
-            self.game.connect()
-            self.game.start_episode(self.current_start_position_idx)
+        # Spawn surrounding vehicles
+        random.shuffle(self.vehicle_spawn_points)
+        count = self.number_of_vehicles
+        if count > 0:
+            for spawn_point in self.vehicle_spawn_points:
+                if self._try_spawn_random_vehicle_at(spawn_point, number_of_wheels=[4]):
+                    count -= 1
+                if count <= 0:
+                    break
+        while count > 0:
+            if self._try_spawn_random_vehicle_at(random.choice(self.vehicle_spawn_points), number_of_wheels=[4]):
+                count -= 1
 
-        # start the game with some initial speed
-        for i in range(self.num_speedup_steps):
-            self.control = VehicleControl(throttle=1.0, brake=0, steer=0, hand_brake=False, reverse=False)
-            self.game.send_control(VehicleControl())
+        # Spawn pedestrians
+        random.shuffle(self.walker_spawn_points)
+        count = self.number_of_walkers
+        if count > 0:
+            for spawn_point in self.walker_spawn_points:
+                if self._try_spawn_random_walker_at(spawn_point):
+                    count -= 1
+                if count <= 0:
+                    break
+        while count > 0:
+            if self._try_spawn_random_walker_at(random.choice(self.walker_spawn_points)):
+                count -= 1
+
+        # Get actors polygon list
+        self.vehicle_polygons = []
+        vehicle_poly_dict = self._get_actor_polygons('vehicle.*')
+        self.vehicle_polygons.append(vehicle_poly_dict)
+        self.walker_polygons = []
+        walker_poly_dict = self._get_actor_polygons('walker.*')
+        self.walker_polygons.append(walker_poly_dict)
+
+        # Spawn the ego vehicle
+        ego_spawn_times = 0
+        while True:
+            if ego_spawn_times > self.max_ego_spawn_times:
+                self._restart_environment_episode()
+
+            transform = random.choice(self.vehicle_spawn_points)
+            if self._try_spawn_ego_vehicle_at(transform):
+                break
+            else:
+                ego_spawn_times += 1
+                time.sleep(0.1)
+
+        # Add collision sensor
+        self.collision_sensor = self.world.spawn_actor(self.collision_bp, carla.Transform(), attach_to=self.ego)
+        self.collision_sensor.listen(lambda event: get_collision_hist(event))
+        def get_collision_hist(event):
+            impulse = event.normal_impulse
+            intensity = np.sqrt(impulse.x**2 + impulse.y**2 + impulse.z**2)
+            self.collision_hist.append(intensity)
+            if len(self.collision_hist)>self.collision_hist_l:
+                self.collision_hist.pop(0)
+        self.collision_hist = []
+
+        # Add lidar sensor
+        self.lidar_sensor = self.world.spawn_actor(self.lidar_bp, self.lidar_trans, attach_to=self.ego)
+        self.lidar_sensor.listen(lambda data: get_lidar_data(data))
+        def get_lidar_data(data):
+            self.lidar_data = data
+
+        # Add camera sensor
+        self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
+        self.camera_sensor.listen(lambda data: get_camera_img(data))
+        def get_camera_img(data):
+            array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
+            array = np.reshape(array, (data.height, data.width, 4))
+            array = array[:, :, :3]
+            array = array[:, :, ::-1]
+            self.camera_img = array
+
+        # Update timesteps
+        self.time_step=0
+        self.reset_step+=1
+
+        # Enable sync mode
+        self._set_synchronous_mode(True)
+        self.world.tick()
+
+        self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
+        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+
+        # Set ego information for render
+        self.birdeye_render.set_hero(self.ego, self.ego.id)
 
     def get_rendered_image(self) -> np.ndarray:
-        """
-        Return a numpy array containing the image that will be rendered to the screen.
-        This can be different from the observation. For example, mujoco's observation is a measurements vector.
-        :return: numpy array containing the image that will be rendered to the screen
-        """
-        image = [self.state[camera.name] for camera in self.scene.sensors]
-        image = np.vstack(image)
-        return image
+        return resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
 
-    def get_target_success_rate(self) -> float:
-        return self.target_success_rate
+    def _create_vehicle_bluepprint(self, actor_filter, color=None, number_of_wheels=[4]):
+        """Create the blueprint for a specific actor type.
+
+        Args:
+          actor_filter: a string indicating the actor type, e.g, 'vehicle.lincoln*'.
+
+        Returns:
+          bp: the blueprint object of carla.
+        """
+        blueprints = self.world.get_blueprint_library().filter(actor_filter)
+        blueprint_library = []
+        for nw in number_of_wheels:
+            blueprint_library = blueprint_library + [x for x in blueprints if int(x.get_attribute('number_of_wheels')) == nw]
+        bp = random.choice(blueprint_library)
+        if bp.has_attribute('color'):
+            if not color:
+                color = random.choice(bp.get_attribute('color').recommended_values)
+            bp.set_attribute('color', color)
+        return bp
+
+    def _init_renderer(self):
+        """Initialize the birdeye view renderer.
+        """
+        pygame.init()
+        self.display = pygame.display.set_mode(
+        (self.display_size * 3, self.display_size),
+        pygame.HWSURFACE | pygame.DOUBLEBUF)
+
+        pixels_per_meter = self.display_size / self.obs_range
+        pixels_ahead_vehicle = (self.obs_range/2 - self.d_behind) * pixels_per_meter
+        birdeye_params = {
+          'screen_size': [self.display_size, self.display_size],
+          'pixels_per_meter': pixels_per_meter,
+          'pixels_ahead_vehicle': pixels_ahead_vehicle
+        }
+        self.birdeye_render = BirdeyeRender(self.world, birdeye_params)
+
+    def _set_synchronous_mode(self, synchronous = True):
+        """Set whether to use the synchronous mode.
+        """
+        self.settings.synchronous_mode = synchronous
+        self.world.apply_settings(self.settings)
+        self.traffic_manager.set_synchronous_mode(synchronous)
+
+    def _try_spawn_random_vehicle_at(self, transform, number_of_wheels=[4]):
+        """Try to spawn a surrounding vehicle at specific transform with random bluprint.
+
+        Args:
+          transform: the carla transform object.
+
+        Returns:
+          Bool indicating whether the spawn is successful.
+        """
+        blueprint = self._create_vehicle_bluepprint('vehicle.*', number_of_wheels=number_of_wheels)
+        blueprint.set_attribute('role_name', 'autopilot')
+        vehicle = self.world.try_spawn_actor(blueprint, transform)
+        if vehicle is not None:
+            vehicle.set_autopilot()
+            return True
+        return False
+
+    def _try_spawn_random_walker_at(self, transform):
+        """Try to spawn a walker at specific transform with random bluprint.
+
+        Args:
+          transform: the carla transform object.
+
+        Returns:
+          Bool indicating whether the spawn is successful.
+        """
+        walker_bp = random.choice(self.world.get_blueprint_library().filter('walker.*'))
+        # set as not invencible
+        if walker_bp.has_attribute('is_invincible'):
+            walker_bp.set_attribute('is_invincible', 'false')
+        walker_actor = self.world.try_spawn_actor(walker_bp, transform)
+
+        if walker_actor is not None:
+            walker_controller_bp = self.world.get_blueprint_library().find('controller.ai.walker')
+            walker_controller_actor = self.world.spawn_actor(walker_controller_bp, carla.Transform(), walker_actor)
+            # start walker
+            walker_controller_actor.start()
+            # set walk to random point
+            walker_controller_actor.go_to_location(self.world.get_random_location_from_navigation())
+            # random max speed
+            walker_controller_actor.set_max_speed(1 + random.random())    # max speed between 1 and 2 (default is 1.4 m/s)
+            return True
+        return False
+
+    def _try_spawn_ego_vehicle_at(self, transform):
+        """Try to spawn the ego vehicle at specific transform.
+        Args:
+          transform: the carla transform object.
+        Returns:
+          Bool indicating whether the spawn is successful.
+        """
+        vehicle = None
+        # Check if ego position overlaps with surrounding vehicles
+        overlap = False
+        for idx, poly in self.vehicle_polygons[-1].items():
+            poly_center = np.mean(poly, axis=0)
+            ego_center = np.array([transform.location.x, transform.location.y])
+            dis = np.linalg.norm(poly_center - ego_center)
+            if dis > 8:
+                continue
+            else:
+                overlap = True
+                break
+
+        if not overlap:
+            vehicle = self.world.try_spawn_actor(self.ego_bp, transform)
+
+        if vehicle is not None:
+            self.ego=vehicle
+            return True
+
+        return False
+
+    def _get_actor_polygons(self, filt):
+        """Get the bounding box polygon of actors.
+
+        Args:
+          filt: the filter indicating what type of actors we'll look at.
+
+        Returns:
+          actor_poly_dict: a dictionary containing the bounding boxes of specific actors.
+        """
+        actor_poly_dict={}
+        for actor in self.world.get_actors().filter(filt):
+            # Get x, y and yaw of the actor
+            trans=actor.get_transform()
+            x=trans.location.x
+            y=trans.location.y
+            yaw=trans.rotation.yaw/180*np.pi
+            # Get length and width
+            bb=actor.bounding_box
+            l=bb.extent.x
+            w=bb.extent.y
+            # Get bounding box polygon in the actor's local coordinate
+            poly_local=np.array([[l,w],[l,-w],[-l,-w],[-l,w]]).transpose()
+            # Get rotation matrix to transform to global coordinate
+            R=np.array([[np.cos(yaw),-np.sin(yaw)],[np.sin(yaw),np.cos(yaw)]])
+            # Get global bounding box polygon
+            poly=np.matmul(R,poly_local).transpose()+np.repeat([[x,y]],4,axis=0)
+            actor_poly_dict[actor.id]=poly
+        return actor_poly_dict
+
+    def _get_obs(self):
+        """Get the observations."""
+        ## Birdeye rendering
+        self.birdeye_render.vehicle_polygons = self.vehicle_polygons
+        self.birdeye_render.walker_polygons = self.walker_polygons
+        self.birdeye_render.waypoints = self.waypoints
+
+        # birdeye view with roadmap and actors
+        birdeye_render_types = ['roadmap', 'actors']
+        if self.display_route:
+          birdeye_render_types.append('waypoints')
+        self.birdeye_render.render(self.display, birdeye_render_types)
+        birdeye = pygame.surfarray.array3d(self.display)
+        birdeye = birdeye[0:self.display_size, :, :]
+        birdeye = display_to_rgb(birdeye, self.obs_size)
+
+        ## Lidar image generation
+        point_cloud = []
+        # Get point cloud data
+        for location in self.lidar_data:
+          point_cloud.append([location.x, location.y, -location.z])
+        point_cloud = np.array(point_cloud)
+        # Separate the 3D space to bins for point cloud, x and y is set according to self.lidar_bin,
+        # and z is set to be two bins.
+        y_bins = np.arange(-(self.obs_range - self.d_behind), self.d_behind+self.lidar_bin, self.lidar_bin)
+        x_bins = np.arange(-self.obs_range/2, self.obs_range/2+self.lidar_bin, self.lidar_bin)
+        z_bins = [-self.lidar_height-1, -self.lidar_height+0.25, 1]
+        # Get lidar image according to the bins
+        lidar, _ = np.histogramdd(point_cloud, bins=(x_bins, y_bins, z_bins))
+        lidar[:,:,0] = np.array(lidar[:,:,0]>0, dtype=np.uint8)
+        lidar[:,:,1] = np.array(lidar[:,:,1]>0, dtype=np.uint8)
+        # Add the waypoints to lidar image
+        if self.display_route:
+          wayptimg = (birdeye[:,:,0] <= 10) * (birdeye[:,:,1] <= 10) * (birdeye[:,:,2] >= 240)
+        else:
+          wayptimg = birdeye[:,:,0] < 0  # Equal to a zero matrix
+        wayptimg = np.expand_dims(wayptimg, axis=2)
+        wayptimg = np.fliplr(np.rot90(wayptimg, 3))
+
+        # Get the final lidar image
+        lidar = np.concatenate((lidar, wayptimg), axis=2)
+        lidar = np.flip(lidar, axis=1)
+        lidar = np.rot90(lidar, 1)
+        lidar = lidar * 255
+
+        ## Display camera image
+        camera = resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
+
+        # State observation
+        ego_trans = self.ego.get_transform()
+        ego_x = ego_trans.location.x
+        ego_y = ego_trans.location.y
+        ego_yaw = ego_trans.rotation.yaw/180*np.pi
+        lateral_dis, w = get_preview_lane_dis(self.waypoints, ego_x, ego_y)
+        delta_yaw = np.arcsin(np.cross(w,
+          np.array(np.array([np.cos(ego_yaw), np.sin(ego_yaw)]))))
+        v = self.ego.get_velocity()
+        speed = np.sqrt(v.x**2 + v.y**2)
+        state = np.array([lateral_dis, - delta_yaw, speed, self.vehicle_front])
+
+        # Update the states in the state space
+        obs = {}
+        obs['measurements'] = state
+        if SensorTypes.FRONT_CAMERA in self.sensors:
+            obs[SensorTypes.FRONT_CAMERA.value] = camera.astype(np.uint8)
+        if SensorTypes.LIDAR.value in self.sensors:
+            obs[SensorTypes.LIDAR.value] = lidar.astype(np.uint8)
+        if SensorTypes.BIRDEYE.value in self.sensors:
+            obs[SensorTypes.BIRDEYE.value] = birdeye.astype(np.uint8)
+
+
+        if self.render_pygame:
+            # Display birdeye image
+            birdeye_surface = rgb_to_display_surface(birdeye, self.display_size)
+            self.display.blit(birdeye_surface, (0, 0))
+
+            # Display lidar image
+            lidar_surface = rgb_to_display_surface(lidar, self.display_size)
+            self.display.blit(lidar_surface, (self.display_size, 0))
+
+            # Display camera image
+            camera_surface = rgb_to_display_surface(camera, self.display_size)
+            self.display.blit(camera_surface, (self.display_size * 2, 0))
+
+            # Display on pygame
+            pygame.display.flip()
+
+        return obs
+
+    def _get_reward(self):
+        """Calculate the step reward."""
+        # reward for speed tracking
+        v = self.ego.get_velocity()
+        speed = np.sqrt(v.x**2 + v.y**2)
+        r_speed = -abs(speed - self.desired_speed)
+
+        # reward for collision
+        r_collision = 0
+        if len(self.collision_hist) > 0:
+            r_collision = -1
+
+        # reward for steering:
+        r_steer = -self.ego.get_control().steer**2
+
+        # reward for out of lane
+        ego_x, ego_y = get_pos(self.ego)
+        dis, w = get_lane_dis(self.waypoints, ego_x, ego_y)
+        r_out = 0
+        if abs(dis) > self.out_lane_thres:
+            r_out = -1
+
+        # longitudinal speed
+        lspeed = np.array([v.x, v.y])
+        lspeed_lon = np.dot(lspeed, w)
+
+        # cost for too fast
+        r_fast = 0
+        if lspeed_lon > self.desired_speed:
+            r_fast = -1
+
+        # cost for lateral acceleration
+        r_lat = - abs(self.ego.get_control().steer) * lspeed_lon**2
+
+        r = 200*r_collision + 1*lspeed_lon + 10*r_fast + 1*r_out + r_steer*5 + 0.2*r_lat - 0.1
+
+        return r
+
+    def _terminal(self):
+        """Calculate whether to terminate the current episode."""
+        # Get ego state
+        ego_x, ego_y = get_pos(self.ego)
+
+        # If collides
+        if len(self.collision_hist)>0:
+            return True
+
+        # If reach maximum timestep
+        if self.time_step>self.max_time_episode:
+            return True
+
+        # If out of lane
+        dis, _ = get_lane_dis(self.waypoints, ego_x, ego_y)
+        if abs(dis) > self.out_lane_thres:
+            return True
+
+        return False
+
+    def _get_spawn_points(self):
+        self.vehicle_spawn_points = list(self.world.get_map().get_spawn_points())
+        self.walker_spawn_points = []
+        for i in range(self.number_of_walkers):
+          spawn_point = carla.Transform()
+          loc = self.world.get_random_location_from_navigation()
+          if (loc != None):
+            spawn_point.location = loc
+            self.walker_spawn_points.append(spawn_point)
+
+    def _clear_all_actors(self, actor_filters):
+        """Clear specific actors."""
+        for actor_filter in actor_filters:
+            actor_list = self.world.get_actors().filter(actor_filter)
+            self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
