@@ -1,6 +1,6 @@
 from rl_coach.agents.dqn_agent import DQNAgentParameters
 from rl_coach.base_parameters import VisualizationParameters, PresetValidationParameters
-from rl_coach.environments.carla_coach_env import CarlaEnvironmentParameters
+from rl_coach.environments.carla_environment import CarlaEnvironmentParameters
 
 from rl_coach.graph_managers.graph_manager import SimpleSchedule
 from rl_coach.core_types import EnvironmentSteps

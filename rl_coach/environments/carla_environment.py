@@ -105,7 +105,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
 
     @property
     def path(self):
-        return 'rl_coach.environments.carla_coach_env:CarlaEnvironment'
+        return 'rl_coach.environments.carla_environment:CarlaEnvironment'
 
 class CarlaEnvironment(Environment):
     """A coach wrapper for CARLA simulator."""
