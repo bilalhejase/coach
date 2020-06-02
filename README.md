@@ -232,17 +232,17 @@ There are [example](https://github.com/NervanaSystems/coach/blob/master/rl_coach
 
 * *CARLA:*
 
-    Download release 0.8.4 from the CARLA repository -
+    Download release 0.9.9 from the CARLA repository -
 
     https://github.com/carla-simulator/carla/releases
 
-    Install the python client and dependencies from the release tarball:
+    Create a new CARLA_ROOT environment variable pointing to CARLA's installation directory. Create a new CARLA_SERVER environment variable. Include the CARLA PythonAPI to the Python path.
+    
     ```
-    pip3 install -r PythonClient/requirements.txt
-    pip3 install PythonClient
+    export CARLA_ROOT=/path/to/your/carla/installation
+    export CARLA_SERVER=${CARLA_ROOT}/CarlaUE4.sh
+    export PYTHONPATH=$PYTHONPATH:${CARLA_ROOT}/PythonAPI/carla/dist/carla-<VERSION>.egg:${CARLA_ROOT}/PythonAPI/carla
     ```
-
-    Create a new CARLA_ROOT environment variable pointing to CARLA's installation directory.
 
     A simple CARLA settings file (```CarlaSettings.ini```) is supplied with Coach, and is located in the ```environments``` directory.
 
