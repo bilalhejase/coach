@@ -137,9 +137,10 @@ For example:
   ```
 
 * CARLA environment using DQN algorithm:
-```bash
-coach -r -p CARLA_DQN
-```
+
+  ```bash
+  coach -r -p CARLA_DQN
+  ```
   
 * Basic level of Doom using Dueling network and Double DQN (DDQN) algorithm:
 
