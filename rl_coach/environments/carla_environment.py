@@ -33,7 +33,7 @@ from rl_coach.filters.observation.observation_rescale_to_size_filter import Obse
 from rl_coach.filters.observation.observation_stacking_filter import ObservationStackingFilter
 
 
-CARLA_WEATHER_PRESETS = { # Added
+CARLA_WEATHER_PRESETS = {
     0: carla.WeatherParameters.Default,
     1: carla.WeatherParameters.ClearNoon,
     2: carla.WeatherParameters.CloudyNoon,
@@ -57,6 +57,8 @@ CARLA_WEATHER_PRESETS = { # Added
 CarlaInputFilter = NoInputFilter()
 CarlaOutputFilter = NoOutputFilter()
 
+# Enumerate observation sources
+# New observation sources need to be appended here
 class SensorTypes(Enum):
     FRONT_CAMERA = "forward_camera"
     LIDAR = "lidar"
@@ -69,8 +71,8 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.port = 2000
         self.timeout = 10.0 # Carla client timeout
         self.level = 'Town03' # Name of the world
-        self.number_of_vehicles = 10
-        self.number_of_walkers = 0
+        self.number_of_vehicles = 0 # traffic
+        self.number_of_walkers = 0 # pedestrian traffic
         self.weather_id = 1 # Weather IDs: https://carla.readthedocs.io/en/stable/carla_settings/
 
         self.frame_skip = 1 # number of frames to repeat the same action
@@ -79,7 +81,8 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.display_size = 256 # screen size of bird-eye render
         self.display_route = True # whether to render the desired route
         self.render_pygame = True # whether to render the pygame window
-        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR] # defines list of sensor for the state space
+        # Example of adding sensors: self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR]
+        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR] # defines a list of sensors for the state space
         self.camera_height = 256
         self.camera_width = 256
         self.obs_range = 32 # observation range (meter)
@@ -89,15 +92,15 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.desired_speed = 8 # desired speed (m/s)
 
         self.discrete = True # whether to use discrete control space
-        self.discrete_acc = [-3.0, 0.0, 3.0] # discrete value of accelerations
-        self.discrete_steer = [-0.2, 0.0, 0.2] # discrete value of steering angles
+        self.discrete_acc = [-3.0, -1.5, 0.0, 1.5, 3.0] # discrete value of accelerations
+        self.discrete_steer = [-0.9, -0.5, -0.2, 0.0, 0.2, 0.5, 0.9] # discrete value of steering angles
         self.continuous_accel_range = [-3.0, 3.0]  # continuous acceleration range
         self.continuous_steer_range = [-0.3, 0.3]  # continuous steering angle range
 
         self.max_past_step = 1 # the number of past steps to draw
         self.dt = 0.1  # time interval between two frames
         self.max_ego_spawn_times = 200 # maximum times to spawn ego vehicle
-        self.max_time_episode = 1000 # maximum `timestep`s per episode
+        self.max_time_episode = 500 # maximum `timestep`s per episode
         self.max_waypt = 12 # maximum number of waypoints
 
         self.default_input_filter = CarlaInputFilter
@@ -113,7 +116,7 @@ class CarlaEnvironment(Environment):
                seed: int, frame_skip: int, human_control: bool, custom_reward_threshold: Union[int, float],
                visualization_parameters: VisualizationParameters,
                host: str, port: int, timeout: float,
-               number_of_vehicles: int, number_of_walkers: int, weather_id: int,
+               number_of_vehicles: int, number_of_walkers: int, weather_id: int, #rendering_mode: bool,
                ego_vehicle_filter: str, display_size: int,
                sensors: List[SensorTypes], camera_height: int, camera_width: int,
                lidar_bin: float, obs_range: float, display_route: bool, render_pygame: bool,
@@ -206,6 +209,8 @@ class CarlaEnvironment(Environment):
         # Set fixed simulation step for synchronous mode
         self.settings = self.world.get_settings()
         self.settings.fixed_delta_seconds = self.dt
+        #self.settings.no_rendering_mode = rendering_mode
+        self._set_synchronous_mode(True)
 
         # Record the time of total steps and resetting steps
         self.reset_step = 0
@@ -228,11 +233,8 @@ class CarlaEnvironment(Environment):
         })
 
         if SensorTypes.FRONT_CAMERA in self.sensors:
-            #self._add_camera()
             self.state_space[SensorTypes.FRONT_CAMERA.value] = ImageObservationSpace(shape=np.array([self.camera_height, self.camera_width, 3]), high=255)
         if SensorTypes.LIDAR in self.sensors:
-            #self._add_lidar()
-            # @TODO: CHECK IF IT IS BETTER TO USE AN IMAGEOOBSERVATIONSPACE OBJECT
             self.state_space[SensorTypes.LIDAR.value] = PlanarMapsObservationSpace(shape=np.array([self.obs_size, self.obs_size, 3]), low=0, high=255)
         if SensorTypes.BIRDEYE in self.sensors:
             self.state_space[SensorTypes.BIRDEYE.value] = ImageObservationSpace(shape=np.array([self.obs_size, self.obs_size, 3]), high=255)
@@ -379,20 +381,22 @@ class CarlaEnvironment(Environment):
         self.collision_hist = []
 
         # Add lidar sensor
-        self.lidar_sensor = self.world.spawn_actor(self.lidar_bp, self.lidar_trans, attach_to=self.ego)
-        self.lidar_sensor.listen(lambda data: get_lidar_data(data))
-        def get_lidar_data(data):
-            self.lidar_data = data
+        if SensorTypes.LIDAR in self.sensors:
+            self.lidar_sensor = self.world.spawn_actor(self.lidar_bp, self.lidar_trans, attach_to=self.ego)
+            self.lidar_sensor.listen(lambda data: get_lidar_data(data))
+            def get_lidar_data(data):
+                self.lidar_data = data
 
         # Add camera sensor
-        self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
-        self.camera_sensor.listen(lambda data: get_camera_img(data))
-        def get_camera_img(data):
-            array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
-            array = np.reshape(array, (data.height, data.width, 4))
-            array = array[:, :, :3]
-            array = array[:, :, ::-1]
-            self.camera_img = array
+        if SensorTypes.FRONT_CAMERA in self.sensors:
+            self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
+            self.camera_sensor.listen(lambda data: get_camera_img(data))
+            def get_camera_img(data):
+                array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
+                array = np.reshape(array, (data.height, data.width, 4))
+                array = array[:, :, :3]
+                array = array[:, :, ::-1]
+                self.camera_img = array
 
         # Update timesteps
         self.time_step=0
@@ -409,7 +413,8 @@ class CarlaEnvironment(Environment):
         self.birdeye_render.set_hero(self.ego, self.ego.id)
 
     def get_rendered_image(self) -> np.ndarray:
-        return resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
+        return self.birdeye
+        #return resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
 
     def _create_vehicle_bluepprint(self, actor_filter, color=None, number_of_wheels=[4]):
         """Create the blueprint for a specific actor type.
@@ -452,8 +457,8 @@ class CarlaEnvironment(Environment):
         """Set whether to use the synchronous mode.
         """
         self.settings.synchronous_mode = synchronous
-        self.world.apply_settings(self.settings)
         self.traffic_manager.set_synchronous_mode(synchronous)
+        self.world.apply_settings(self.settings)
 
     def _try_spawn_random_vehicle_at(self, transform, number_of_wheels=[4]):
         """Try to spawn a surrounding vehicle at specific transform with random bluprint.
@@ -574,36 +579,38 @@ class CarlaEnvironment(Environment):
         birdeye = display_to_rgb(birdeye, self.obs_size)
 
         ## Lidar image generation
-        point_cloud = []
-        # Get point cloud data
-        for location in self.lidar_data:
-          point_cloud.append([location.x, location.y, -location.z])
-        point_cloud = np.array(point_cloud)
-        # Separate the 3D space to bins for point cloud, x and y is set according to self.lidar_bin,
-        # and z is set to be two bins.
-        y_bins = np.arange(-(self.obs_range - self.d_behind), self.d_behind+self.lidar_bin, self.lidar_bin)
-        x_bins = np.arange(-self.obs_range/2, self.obs_range/2+self.lidar_bin, self.lidar_bin)
-        z_bins = [-self.lidar_height-1, -self.lidar_height+0.25, 1]
-        # Get lidar image according to the bins
-        lidar, _ = np.histogramdd(point_cloud, bins=(x_bins, y_bins, z_bins))
-        lidar[:,:,0] = np.array(lidar[:,:,0]>0, dtype=np.uint8)
-        lidar[:,:,1] = np.array(lidar[:,:,1]>0, dtype=np.uint8)
-        # Add the waypoints to lidar image
-        if self.display_route:
-          wayptimg = (birdeye[:,:,0] <= 10) * (birdeye[:,:,1] <= 10) * (birdeye[:,:,2] >= 240)
-        else:
-          wayptimg = birdeye[:,:,0] < 0  # Equal to a zero matrix
-        wayptimg = np.expand_dims(wayptimg, axis=2)
-        wayptimg = np.fliplr(np.rot90(wayptimg, 3))
+        if SensorTypes.LIDAR in self.sensors:
+            point_cloud = []
+            # Get point cloud data
+            for location in self.lidar_data:
+              point_cloud.append([location.x, location.y, -location.z])
+            point_cloud = np.array(point_cloud)
+            # Separate the 3D space to bins for point cloud, x and y is set according to self.lidar_bin,
+            # and z is set to be two bins.
+            y_bins = np.arange(-(self.obs_range - self.d_behind), self.d_behind+self.lidar_bin, self.lidar_bin)
+            x_bins = np.arange(-self.obs_range/2, self.obs_range/2+self.lidar_bin, self.lidar_bin)
+            z_bins = [-self.lidar_height-1, -self.lidar_height+0.25, 1]
+            # Get lidar image according to the bins
+            lidar, _ = np.histogramdd(point_cloud, bins=(x_bins, y_bins, z_bins))
+            lidar[:,:,0] = np.array(lidar[:,:,0]>0, dtype=np.uint8)
+            lidar[:,:,1] = np.array(lidar[:,:,1]>0, dtype=np.uint8)
+            # Add the waypoints to lidar image
+            if self.display_route:
+              wayptimg = (birdeye[:,:,0] <= 10) * (birdeye[:,:,1] <= 10) * (birdeye[:,:,2] >= 240)
+            else:
+              wayptimg = birdeye[:,:,0] < 0  # Equal to a zero matrix
+            wayptimg = np.expand_dims(wayptimg, axis=2)
+            wayptimg = np.fliplr(np.rot90(wayptimg, 3))
 
-        # Get the final lidar image
-        lidar = np.concatenate((lidar, wayptimg), axis=2)
-        lidar = np.flip(lidar, axis=1)
-        lidar = np.rot90(lidar, 1)
-        lidar = lidar * 255
+            # Get the final lidar image
+            lidar = np.concatenate((lidar, wayptimg), axis=2)
+            lidar = np.flip(lidar, axis=1)
+            lidar = np.rot90(lidar, 1)
+            lidar = lidar * 255
 
         ## Display camera image
-        camera = resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
+        if SensorTypes.FRONT_CAMERA in self.sensors:
+            camera = resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
 
         # State observation
         ego_trans = self.ego.get_transform()
@@ -630,16 +637,19 @@ class CarlaEnvironment(Environment):
 
         if self.render_pygame:
             # Display birdeye image
+            self.birdeye = birdeye
             birdeye_surface = rgb_to_display_surface(birdeye, self.display_size)
             self.display.blit(birdeye_surface, (0, 0))
 
             # Display lidar image
-            lidar_surface = rgb_to_display_surface(lidar, self.display_size)
-            self.display.blit(lidar_surface, (self.display_size, 0))
+            if SensorTypes.LIDAR in self.sensors:
+                lidar_surface = rgb_to_display_surface(lidar, self.display_size)
+                self.display.blit(lidar_surface, (self.display_size, 0))
 
             # Display camera image
-            camera_surface = rgb_to_display_surface(camera, self.display_size)
-            self.display.blit(camera_surface, (self.display_size * 2, 0))
+            if SensorTypes.FRONT_CAMERA in self.sensors:
+                camera_surface = rgb_to_display_surface(camera, self.display_size)
+                self.display.blit(camera_surface, (self.display_size * 2, 0))
 
             # Display on pygame
             pygame.display.flip()
