@@ -144,8 +144,8 @@ class CarlaEnvironment(Environment):
                max_ego_spawn_times: int, max_time_episode: int, max_waypt: int, **kwargs):
         super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
 
-        # Define if we will use the global planner
-        self.globalplan = 1 # 1 yes, 0 no
+        # Define if we will use the global planner TODO: make an argument
+        self.globalplan = 0 # 1 use global planner, 0 don't use global planner
 
         self.level = level
         # self.frame_skip = frame_skip
