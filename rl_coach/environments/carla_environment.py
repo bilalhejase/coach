@@ -12,6 +12,10 @@ import carla
 from rl_coach.environments.carla.render import BirdeyeRender
 from rl_coach.environments.carla.route_planner import RoutePlanner
 from rl_coach.environments.carla.misc import *
+from rl_coach.environments.carla.global_route_planner import GlobalRoutePlanner
+from rl_coach.environments.carla.global_route_planner_dao import GlobalRoutePlannerDAO
+from rl_coach.environments.carla.modified_local_planner import ModifiedLocalPlanner
+import math
 
 # Coach imports
 from rl_coach.logger import screen
@@ -32,6 +36,19 @@ from rl_coach.filters.filter import NoInputFilter, NoOutputFilter
 from rl_coach.filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
 from rl_coach.filters.observation.observation_stacking_filter import ObservationStackingFilter
 
+# ==============================================================================
+# -- Get colors for debugging --------------------------------------------------
+# ==============================================================================
+
+red = carla.Color(255, 0, 0)
+green = carla.Color(0, 255, 0)
+blue = carla.Color(47, 210, 231)
+cyan = carla.Color(0, 255, 255)
+yellow = carla.Color(255, 255, 0)
+orange = carla.Color(255, 162, 0)
+white = carla.Color(255, 255, 255)
+
+# ==============================================================================
 
 CARLA_WEATHER_PRESETS = {
     0: carla.WeatherParameters.Default,
@@ -106,6 +123,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.default_input_filter = CarlaInputFilter
         self.default_output_filter = CarlaOutputFilter
 
+
     @property
     def path(self):
         return 'rl_coach.environments.carla_environment:CarlaEnvironment'
@@ -125,6 +143,9 @@ class CarlaEnvironment(Environment):
                continuous_accel_range: List[float], continuous_steer_range: List[float],
                max_ego_spawn_times: int, max_time_episode: int, max_waypt: int, **kwargs):
         super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
+
+        # Define if we will use the global planner
+        self.globalplan = 1 # 1 yes, 0 no
 
         self.level = level
         # self.frame_skip = frame_skip
@@ -180,7 +201,7 @@ class CarlaEnvironment(Environment):
         self._get_spawn_points()
 
         # Create the ego vehicle blueprint
-        self.ego_bp = self._create_vehicle_bluepprint(self.ego_vehicle_filter, color='49,8,8')
+        self.ego_bp = self._create_vehicle_blueprint(self.ego_vehicle_filter, color='49,8,8')
 
         # Collision sensor
         self.collision_hist = [] # The collision history
@@ -244,6 +265,8 @@ class CarlaEnvironment(Environment):
 
         self.reset_internal_state(True)
 
+
+
     def _update_state(self):
         """ Update the internal state of the wrapper
         self.state - a dictionary containing all the observations from the environment and follows the state_space definition
@@ -267,14 +290,23 @@ class CarlaEnvironment(Environment):
         while len(self.walker_polygons) > self.max_past_step:
           self.walker_polygons.pop(0)
 
-        # route planner
-        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
-
-        # state information
-        info = {
-          'waypoints': self.waypoints,
-          'vehicle_front': self.vehicle_front
-        }
+        if self.globalplan == 0:
+            # route planner
+            self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+            # state information
+            info = {
+                'waypoints': self.waypoints,
+                'vehicle_front': self.vehicle_front
+            }
+        else:
+            self.d2wp, self.d2goal, _, _, _, self.waypoints, self.vehicle_front = self._local_planner.run_step()
+            # state information
+            info = {
+                'waypoints': self.waypoints,
+                'vehicle_front': self.vehicle_front
+                # 'd2wp': self.d2wp,
+                # 'd2goal': self.d2goal,
+            }
 
         # Update timesteps
         self.time_step += 1
@@ -356,18 +388,67 @@ class CarlaEnvironment(Environment):
         walker_poly_dict = self._get_actor_polygons('walker.*')
         self.walker_polygons.append(walker_poly_dict)
 
+        if self.globalplan:
+            ########################## Global planner
+            self.map = self.world.get_map()
+            self.d2goal = 10000
+            # Initialize the route planner
+            self.dao = GlobalRoutePlannerDAO(self.map, 2.0)  # Create a route for every 2m
+            self.grp = GlobalRoutePlanner(self.dao)
+            self.grp.setup()
+            ###################
+
         # Spawn the ego vehicle
         ego_spawn_times = 0
         while True:
             if ego_spawn_times > self.max_ego_spawn_times:
                 self._restart_environment_episode()
 
-            transform = random.choice(self.vehicle_spawn_points)
-            if self._try_spawn_ego_vehicle_at(transform):
-                break
+            if self.globalplan == 0:
+                transform = random.choice(self.vehicle_spawn_points) # Make an option between global planner and not planner
+                if self._try_spawn_ego_vehicle_at(transform):
+                    break
+                else:
+                    ego_spawn_times += 1
+                    time.sleep(0.1)
             else:
-                ego_spawn_times += 1
-                time.sleep(0.1)
+                #################### Global planner ############################
+                spawn_points = self.vehicle_spawn_points
+
+                while self.d2goal > 150 or self.d2goal < 50: # route min 50 m, max 150 m
+                    pos_a = random.choice(spawn_points)
+                    pos_b = random.choice(spawn_points)
+
+                    a = pos_a.location
+                    b = pos_b.location
+
+                    self.current_plan = self.grp.trace_route(a, b)
+
+                    self.d2goal = self.total_distance(self.current_plan)
+
+                self.transform = pos_a
+                # self.vehicle = self.world.try_spawn_actor(self.mycar, self.transform)
+                if self._try_spawn_ego_vehicle_at(self.transform):
+                    args_lateral_dict = {'K_P': 1, 'K_D': 0.02, 'K_I': 1, 'dt': 1.0 / 20.0}
+                    target_speed = 50
+                    self._local_planner = ModifiedLocalPlanner(
+                        self.ego, self.max_waypt, opt_dict={'target_speed': target_speed,
+                                                'lateral_control_dict': args_lateral_dict})
+
+                    # assert self.current_plan
+                    self._local_planner.set_global_plan(self.current_plan)
+                    self.current_plan = self.current_plan[0:len(self.current_plan) - 5][:]
+
+                    # Draw path for debugging
+                    self.draw_path(self.world, self.current_plan)
+
+                    # transform = self.transform
+                    break
+                else:
+                    ego_spawn_times += 1
+                    time.sleep(0.1)
+                ##########################################################
+
 
         # Add collision sensor
         self.collision_sensor = self.world.spawn_actor(self.collision_bp, carla.Transform(), attach_to=self.ego)
@@ -406,17 +487,53 @@ class CarlaEnvironment(Environment):
         self._set_synchronous_mode(True)
         self.world.tick()
 
-        self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
-        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+        if self.globalplan == 0:
+            self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
+            self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+        else:
+            self.d2wp, self.d2goal, _, _, _, self.waypoints, self.vehicle_front = self._local_planner.run_step()
+
 
         # Set ego information for render
         self.birdeye_render.set_hero(self.ego, self.ego.id)
+
+        ########## If global route, even without global route
+        # Place random vehicle just in front of our vehicle
+        # if random.randint(0, 10) < 3:
+        #     # We set the vehicle on the road, with random moving according to a discrete uniform distribution
+        #     self.car_actor = self.world.try_spawn_actor(self.obs, pos_b)
+        #
+        #     if random.randint(0,10) < 5:
+        #         obs_wp = self.current_plan[math.ceil(len(self.current_plan) / 3)][0]
+        #         self.car_actor.set_autopilot()
+        #     else:
+        #         obs_wp = self.current_plan[math.ceil(len(self.current_plan) / 2)][0]
+        #
+        #     self.car_actor.set_transform(obs_wp.transform)
+        #####################3333
+
+    def place_obs_in_route(self):
+        return 0
+    # Place a vehicle randomly on the road
+    # if random.randint(0, 10) < 3:
+    #     # We set the vehicle on the road, with random moving according to a discrete uniform distribution
+    #     self.car_actor = self.world.try_spawn_actor(self.obs, pos_b)
+    #
+    #     if random.randint(0,10) < 5:
+    #         obs_wp = self.current_plan[math.ceil(len(self.current_plan) / 3)][0]
+    #         self.car_actor.set_autopilot()
+    #     else:
+    #         obs_wp = self.current_plan[math.ceil(len(self.current_plan) / 2)][0]
+    #
+    #     self.car_actor.set_transform(obs_wp.transform)
+    #
+    #     self.actor_list.append(self.car_actor) # No le pongo sensor porque a este pobre solo lo voy a usar como prop
 
     def get_rendered_image(self) -> np.ndarray:
         return self.birdeye
         #return resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
 
-    def _create_vehicle_bluepprint(self, actor_filter, color=None, number_of_wheels=[4]):
+    def _create_vehicle_blueprint(self, actor_filter, color=None, number_of_wheels=[4]):
         """Create the blueprint for a specific actor type.
 
         Args:
@@ -469,7 +586,7 @@ class CarlaEnvironment(Environment):
         Returns:
           Bool indicating whether the spawn is successful.
         """
-        blueprint = self._create_vehicle_bluepprint('vehicle.*', number_of_wheels=number_of_wheels)
+        blueprint = self._create_vehicle_blueprint('vehicle.*', number_of_wheels=number_of_wheels)
         blueprint.set_attribute('role_name', 'autopilot')
         vehicle = self.world.try_spawn_actor(blueprint, transform)
         if vehicle is not None:
@@ -617,12 +734,18 @@ class CarlaEnvironment(Environment):
         ego_x = ego_trans.location.x
         ego_y = ego_trans.location.y
         ego_yaw = ego_trans.rotation.yaw/180*np.pi
+        # print(self.waypoints)
         lateral_dis, w = get_preview_lane_dis(self.waypoints, ego_x, ego_y)
         delta_yaw = np.arcsin(np.cross(w,
           np.array(np.array([np.cos(ego_yaw), np.sin(ego_yaw)]))))
         v = self.ego.get_velocity()
         speed = np.sqrt(v.x**2 + v.y**2)
         state = np.array([lateral_dis, - delta_yaw, speed, self.vehicle_front])
+
+        # if self.globalplan == 0:
+        #     state = np.array([lateral_dis, - delta_yaw, speed, self.vehicle_front])
+        # else:
+        #     state = np.array([self.d2wp, self.d2goal, speed])
 
         # Update the states in the state space
         obs = {}
@@ -729,3 +852,44 @@ class CarlaEnvironment(Environment):
         for actor_filter in actor_filters:
             actor_list = self.world.get_actors().filter(actor_filter)
             self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
+
+    # ==============================================================================
+    # -- Navigation functions -------------------------------------------------------
+    # ==============================================================================
+
+    def total_distance(self, current_plan):
+        sum = 0
+        for i in range(len(current_plan) - 1):
+            sum = sum + self.distance_wp(current_plan[i + 1][0], current_plan[i][0])
+        return sum
+
+    def distance_wp(self, target, current):
+        dx = target.transform.location.x - current.transform.location.x
+        dy = target.transform.location.y - current.transform.location.y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def distance_goal(self, target, current):
+        dx = target.location.x - current.x
+        dy = target.location.y - current.y
+        return math.sqrt(dx * dx + dy * dy)
+
+    def distance_vehicle(self, waypoint, vehicle_transform):
+        loc = vehicle_transform.location
+        dx = waypoint.transform.location.x - loc.x
+        dy = waypoint.transform.location.y - loc.y
+
+        return math.sqrt(dx * dx + dy * dy)
+
+    def draw_path(self, world, current_plan):
+        for i in range(len(current_plan) - 1):
+            w1 = current_plan[i][0]
+            w2 = current_plan[i + 1][0]
+            self.world.debug.draw_line(w1.transform.location, w2.transform.location, thickness=0.5,
+                                       color=green, life_time=30.0)
+        self.draw_waypoint_info(world, current_plan[-1][0])
+
+    def draw_waypoint_info(self, world, w, lt=30):
+        w_loc = w.transform.location
+        world.debug.draw_point(w_loc, 0.5, red, lt)
+
+    # ==============================================================================
