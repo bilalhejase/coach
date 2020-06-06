@@ -61,6 +61,7 @@ CarlaOutputFilter = NoOutputFilter()
 # New observation sources need to be appended here
 class SensorTypes(Enum):
     FRONT_CAMERA = "forward_camera"
+    SEMANTIC = "semseg_camera"
     LIDAR = "lidar"
     BIRDEYE = "birdeye"
 
@@ -71,7 +72,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.port = 2000
         self.timeout = 10.0 # Carla client timeout
         self.level = 'Town03' # Name of the world
-        self.number_of_vehicles = 0 # traffic
+        self.number_of_vehicles = 5 # traffic
         self.number_of_walkers = 0 # pedestrian traffic
         self.weather_id = 1 # Weather IDs: https://carla.readthedocs.io/en/stable/carla_settings/
 
@@ -82,9 +83,11 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.display_route = True # whether to render the desired route
         self.render_pygame = True # whether to render the pygame window
         # Example of adding sensors: self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR]
-        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR] # defines a list of sensors for the state space
-        self.camera_height = 256
-        self.camera_width = 256
+        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.SEMANTIC, SensorTypes.LIDAR, SensorTypes.BIRDEYE] # defines a list of sensors for the state space
+        self.rgb_camera_height = 256
+        self.rgb_camera_width = 256
+        self.semseg_camera_height = 256
+        self.semseg_camera_width = 256
         self.obs_range = 32 # observation range (meter)
         self.lidar_bin = 0.125 # bin size of lidar sensor (meter)
         self.d_behind = 12 # distance behind the ego vehicle (meter)
@@ -118,7 +121,8 @@ class CarlaEnvironment(Environment):
                host: str, port: int, timeout: float,
                number_of_vehicles: int, number_of_walkers: int, weather_id: int, #rendering_mode: bool,
                ego_vehicle_filter: str, display_size: int,
-               sensors: List[SensorTypes], camera_height: int, camera_width: int,
+               sensors: List[SensorTypes], rgb_camera_height: int, rgb_camera_width: int,
+               semseg_camera_height: int, semseg_camera_width: int,
                lidar_bin: float, obs_range: float, display_route: bool, render_pygame: bool,
                d_behind: float, out_lane_thres: float, desired_speed: float, max_past_step: int,
                dt: float, discrete: bool, discrete_acc: List[float], discrete_steer: List[float],
@@ -143,8 +147,10 @@ class CarlaEnvironment(Environment):
         self.ego_vehicle_filter = ego_vehicle_filter
         self.display_size = display_size
         self.sensors = sensors
-        self.camera_height = camera_height
-        self.camera_width = camera_width
+        self.rgb_camera_height = rgb_camera_height
+        self.rgb_camera_width = rgb_camera_width
+        self.semseg_camera_height = semseg_camera_height
+        self.semseg_camera_width = semseg_camera_width
         self.obs_range = obs_range
         self.lidar_bin = lidar_bin
         self.obs_size = int(self.obs_range/self.lidar_bin)
@@ -196,15 +202,26 @@ class CarlaEnvironment(Environment):
         self.lidar_bp.set_attribute('range', '5000')
 
         # Camera sensor
-        self.camera_img = np.zeros((self.camera_height, self.camera_width, 3), dtype=np.uint8)
-        self.camera_trans = carla.Transform(carla.Location(x=0.8, z=1.7))
-        self.camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
+        self.rgb_camera_img = np.zeros((self.rgb_camera_height, self.rgb_camera_width, 3), dtype=np.uint8)
+        self.rgb_camera_trans = carla.Transform(carla.Location(x=0.8, z=1.7))
+        self.rgb_camera_bp = self.world.get_blueprint_library().find('sensor.camera.rgb')
         # Modify the attributes of the blueprint to set image resolution and field of view.
-        self.camera_bp.set_attribute('image_size_x', str(self.camera_width))
-        self.camera_bp.set_attribute('image_size_y', str(self.camera_height))
-        self.camera_bp.set_attribute('fov', '110')
+        self.rgb_camera_bp.set_attribute('image_size_x', str(self.rgb_camera_width))
+        self.rgb_camera_bp.set_attribute('image_size_y', str(self.rgb_camera_height))
+        self.rgb_camera_bp.set_attribute('fov', '110')
         # Set the time in seconds between sensor captures
-        self.camera_bp.set_attribute('sensor_tick', '0.02')
+        self.rgb_camera_bp.set_attribute('sensor_tick', '0.02')
+
+        # Semantic segmentation camera
+        self.semseg_camera_img = np.zeros((self.semseg_camera_height, self.semseg_camera_width, 3), dtype=np.uint8)
+        self.semseg_camera_trans = carla.Transform(carla.Location(x=0.8, z=1.7))
+        self.semseg_camera_bp = self.world.get_blueprint_library().find('sensor.camera.semantic_segmentation')
+        # Modify the attributes of the blueprint
+        self.semseg_camera_bp.set_attribute('image_size_x', str(self.semseg_camera_width))
+        self.semseg_camera_bp.set_attribute('image_size_y', str(self.semseg_camera_height))
+        self.semseg_camera_bp.set_attribute('fov', '110')
+        # Set the time in seconds between sensor captures
+        self.semseg_camera_bp.set_attribute('sensor_tick', '0.02')
 
         # Set fixed simulation step for synchronous mode
         self.settings = self.world.get_settings()
@@ -233,7 +250,9 @@ class CarlaEnvironment(Environment):
         })
 
         if SensorTypes.FRONT_CAMERA in self.sensors:
-            self.state_space[SensorTypes.FRONT_CAMERA.value] = ImageObservationSpace(shape=np.array([self.camera_height, self.camera_width, 3]), high=255)
+            self.state_space[SensorTypes.FRONT_CAMERA.value] = ImageObservationSpace(shape=np.array([self.rgb_camera_height, self.rgb_camera_width, 3]), high=255)
+        if SensorTypes.SEMANTIC in self.sensors:
+            self.state_space[SensorTypes.SEMANTIC.value] = ImageObservationSpace(shape=np.array([self.semseg_camera_height, self.semseg_camera_width, 3]), high=255)
         if SensorTypes.LIDAR in self.sensors:
             self.state_space[SensorTypes.LIDAR.value] = PlanarMapsObservationSpace(shape=np.array([self.obs_size, self.obs_size, 3]), low=0, high=255)
         if SensorTypes.BIRDEYE in self.sensors:
@@ -314,10 +333,11 @@ class CarlaEnvironment(Environment):
         # Clear sensor objects
         self.collision_sensor = None
         self.lidar_sensor = None
-        self.camera_sensor = None
+        self.rgb_camera_sensor = None
+        self.semseg_camera_sensor = None
 
         # Delete sensors, vehicles and walkers
-        self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'vehicle.*', 'controller.ai.walker', 'walker.*'])
+        self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'sensor.camera.semantic_segmentation' 'vehicle.*', 'controller.ai.walker', 'walker.*'])
 
         # Disable sync mode
         self._set_synchronous_mode(False)
@@ -389,14 +409,27 @@ class CarlaEnvironment(Environment):
 
         # Add camera sensor
         if SensorTypes.FRONT_CAMERA in self.sensors:
-            self.camera_sensor = self.world.spawn_actor(self.camera_bp, self.camera_trans, attach_to=self.ego)
-            self.camera_sensor.listen(lambda data: get_camera_img(data))
-            def get_camera_img(data):
+            self.rgb_camera_sensor = self.world.spawn_actor(self.rgb_camera_bp, self.rgb_camera_trans, attach_to=self.ego)
+            self.rgb_camera_sensor.listen(lambda data: get_rgb_img(data))
+            def get_rgb_img(data):
                 array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
                 array = np.reshape(array, (data.height, data.width, 4))
                 array = array[:, :, :3]
                 array = array[:, :, ::-1]
-                self.camera_img = array
+                self.rgb_camera_img = array
+
+        # Add semantic segmentation sensor
+        if SensorTypes.SEMANTIC in self.sensors:
+            self.semseg_camera_sensor = self.world.spawn_actor(self.semseg_camera_bp, self.semseg_camera_trans, attach_to=self.ego)
+            self.semseg_camera_sensor.listen(lambda data: get_semantic_img(data))
+            def get_semantic_img(data):
+                data.convert(carla.ColorConverter.CityScapesPalette)
+                array = np.frombuffer(data.raw_data, dtype = np.dtype("uint8"))
+                array = np.reshape(array, (data.height, data.width, 4))
+                array = array[:, :, :3]
+                array = array[:, :, ::-1]
+                self.semseg_camera_img = array
+
 
         # Update timesteps
         self.time_step=0
@@ -414,7 +447,7 @@ class CarlaEnvironment(Environment):
 
     def get_rendered_image(self) -> np.ndarray:
         return self.birdeye
-        #return resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
+        #return resize(self.rgb_camera_img, (self.rgb_camera_height, self.rgb_camera_width)) * 255
 
     def _create_vehicle_bluepprint(self, actor_filter, color=None, number_of_wheels=[4]):
         """Create the blueprint for a specific actor type.
@@ -441,7 +474,7 @@ class CarlaEnvironment(Environment):
         """
         pygame.init()
         self.display = pygame.display.set_mode(
-        (self.display_size * 3, self.display_size),
+        (self.display_size * 4, self.display_size),
         pygame.HWSURFACE | pygame.DOUBLEBUF)
 
         pixels_per_meter = self.display_size / self.obs_range
@@ -610,7 +643,11 @@ class CarlaEnvironment(Environment):
 
         ## Display camera image
         if SensorTypes.FRONT_CAMERA in self.sensors:
-            camera = resize(self.camera_img, (self.camera_height, self.camera_width)) * 255
+            camera = resize(self.rgb_camera_img, (self.rgb_camera_height, self.rgb_camera_width)) * 255
+
+        ## Display semantic image
+        if SensorTypes.SEMANTIC in self.sensors:
+            semantic = resize(self.semseg_camera_img, (self.semseg_camera_height, self.semseg_camera_width)) * 255
 
         # State observation
         ego_trans = self.ego.get_transform()
@@ -629,6 +666,8 @@ class CarlaEnvironment(Environment):
         obs['measurements'] = state
         if SensorTypes.FRONT_CAMERA in self.sensors:
             obs[SensorTypes.FRONT_CAMERA.value] = camera.astype(np.uint8)
+        if SensorTypes.SEMANTIC in self.sensors:
+            obs[SensorTypes.SEMANTIC.value] = semantic.astype(np.uint8)
         if SensorTypes.LIDAR.value in self.sensors:
             obs[SensorTypes.LIDAR.value] = lidar.astype(np.uint8)
         if SensorTypes.BIRDEYE.value in self.sensors:
@@ -650,6 +689,11 @@ class CarlaEnvironment(Environment):
             if SensorTypes.FRONT_CAMERA in self.sensors:
                 camera_surface = rgb_to_display_surface(camera, self.display_size)
                 self.display.blit(camera_surface, (self.display_size * 2, 0))
+
+            # Display semantic image
+            if SensorTypes.SEMANTIC in self.sensors:
+                semantic_surface = rgb_to_display_surface(semantic, self.display_size)
+                self.display.blit(semantic_surface, (self.display_size * 3, 0))
 
             # Display on pygame
             pygame.display.flip()
@@ -728,4 +772,7 @@ class CarlaEnvironment(Environment):
         """Clear specific actors."""
         for actor_filter in actor_filters:
             actor_list = self.world.get_actors().filter(actor_filter)
+            # if actor_filter == 'controller.ai.walker' and actor_list is not None:
+            #     for actor in actor_list:
+            #         actor.stop()
             self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
