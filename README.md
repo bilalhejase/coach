@@ -7,5 +7,6 @@
 
 <p align="center"><img src="img/coach_logo.png" alt="Coach Logo" width="200"/></p>
 
-To use global planner: change line 148 from rl_coach/environments/carla_environment.py
+To use global planner: change line 134 from rl_coach/environments/carla_environment.py
+TODO: add change as an argument when running `coach -r -p CARLA_DQN`
 
