@@ -14,7 +14,7 @@ import random
 
 import carla
 from rl_coach.environments.carla.modified_controller import VehiclePIDController
-from rl_coach.environments.carla.misc import distance_vehicle, is_within_distance_ahead, compute_magnitude_angle, draw_waypoints
+from rl_coach.environments.carla.misc import *
 
 import math
 
@@ -195,7 +195,7 @@ class ModifiedLocalPlanner(object):
 
         sum = 0
         for i in range(len(current_plan)-1):
-            sum = sum + self.distance_wp(current_plan[i+1][0], current_plan[i][0])
+            sum = sum + distance_wp(current_plan[i+1][0], current_plan[i][0])
 
 
         # print('The total distance over the road is: %0.2f' % sum)
@@ -205,16 +205,16 @@ class ModifiedLocalPlanner(object):
         self._global_plan = True
         self._current_plan = current_plan
 
-    def distance_wp(self,target,current):
-        dx = target.transform.location.x - current.transform.location.x
-        dy = target.transform.location.y - current.transform.location.y
-        return math.sqrt(dx * dx + dy * dy)
+    # def distance_wp(self,target,current):
+    #     dx = target.transform.location.x - current.transform.location.x
+    #     dy = target.transform.location.y - current.transform.location.y
+    #     return math.sqrt(dx * dx + dy * dy)
 
-    def total_distance(self,current_plan):
-        sum = 0
-        for i in range(len(current_plan) - 1):
-            sum = sum + self.distance_wp(current_plan[i + 1][0], current_plan[i][0])
-        return sum
+    # def total_distance(self,current_plan):
+    #     sum = 0
+    #     for i in range(len(current_plan) - 1):
+    #         sum = sum + self.distance_wp(current_plan[i + 1][0], current_plan[i][0])
+    #     return sum
 
     def run_step(self, debug=True):
         """
@@ -291,7 +291,7 @@ class ModifiedLocalPlanner(object):
         if debug:
             draw_waypoints(self._vehicle.get_world(), [self._target_waypoint], self._vehicle.get_location().z + 1.0)
 
-        d2goal = self.total_distance(self._waypoints_queue)+d2wp
+        d2goal = total_distance(self._waypoints_queue)+d2wp
 
         return d2wp,d2goal, len(self._waypoints_queue),self._current_waypoint, self._target_waypoint, waypoints, vehicle_front
 

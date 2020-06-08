@@ -74,8 +74,8 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.port = 2000
         self.timeout = 10.0 # Carla client timeout
         self.level = 'Town03' # Name of the world
-        self.number_of_vehicles = 0 # traffic
-        self.number_of_walkers = 0 # pedestrian traffic
+        self.number_of_vehicles = 10 # traffic
+        self.number_of_walkers = 10 # pedestrian traffic
         self.weather_id = 1 # Weather IDs: https://carla.readthedocs.io/en/stable/carla_settings/
 
         self.frame_skip = 1 # number of frames to repeat the same action
@@ -131,7 +131,7 @@ class CarlaEnvironment(Environment):
         super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
 
         # Define if we will use the global planner TODO: make an argument
-        self.globalplan = 1 # 1 use global planner, 0 don't use global planner
+        self.globalplan = 0 # 1 use global planner, 0 don't use global planner
 
         self.level = level
         # self.frame_skip = frame_skip
