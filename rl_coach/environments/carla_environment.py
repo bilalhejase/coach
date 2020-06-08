@@ -36,20 +36,6 @@ from rl_coach.filters.filter import NoInputFilter, NoOutputFilter
 from rl_coach.filters.observation.observation_rescale_to_size_filter import ObservationRescaleToSizeFilter
 from rl_coach.filters.observation.observation_stacking_filter import ObservationStackingFilter
 
-# ==============================================================================
-# -- Get colors for debugging --------------------------------------------------
-# ==============================================================================
-
-red = carla.Color(255, 0, 0)
-green = carla.Color(0, 255, 0)
-blue = carla.Color(47, 210, 231)
-cyan = carla.Color(0, 255, 255)
-yellow = carla.Color(255, 255, 0)
-orange = carla.Color(255, 162, 0)
-white = carla.Color(255, 255, 255)
-
-# ==============================================================================
-
 CARLA_WEATHER_PRESETS = {
     0: carla.WeatherParameters.Default,
     1: carla.WeatherParameters.ClearNoon,
@@ -145,7 +131,7 @@ class CarlaEnvironment(Environment):
         super().__init__(level, seed, frame_skip, human_control, custom_reward_threshold, visualization_parameters)
 
         # Define if we will use the global planner TODO: make an argument
-        self.globalplan = 0 # 1 use global planner, 0 don't use global planner
+        self.globalplan = 1 # 1 use global planner, 0 don't use global planner
 
         self.level = level
         # self.frame_skip = frame_skip
@@ -424,10 +410,11 @@ class CarlaEnvironment(Environment):
 
                     self.current_plan = self.grp.trace_route(a, b)
 
-                    self.d2goal = self.total_distance(self.current_plan)
+                    self.d2goal = total_distance(self.current_plan)
 
                 self.transform = pos_a
                 # self.vehicle = self.world.try_spawn_actor(self.mycar, self.transform)
+
                 if self._try_spawn_ego_vehicle_at(self.transform):
                     args_lateral_dict = {'K_P': 1, 'K_D': 0.02, 'K_I': 1, 'dt': 1.0 / 20.0}
                     target_speed = 50
@@ -440,7 +427,7 @@ class CarlaEnvironment(Environment):
                     self.current_plan = self.current_plan[0:len(self.current_plan) - 5][:]
 
                     # Draw path for debugging
-                    self.draw_path(self.world, self.current_plan)
+                    draw_path(self.world, self.current_plan)
 
                     # transform = self.transform
                     break
@@ -448,7 +435,6 @@ class CarlaEnvironment(Environment):
                     ego_spawn_times += 1
                     time.sleep(0.1)
                 ##########################################################
-
 
         # Add collision sensor
         self.collision_sensor = self.world.spawn_actor(self.collision_bp, carla.Transform(), attach_to=self.ego)
@@ -853,43 +839,3 @@ class CarlaEnvironment(Environment):
             actor_list = self.world.get_actors().filter(actor_filter)
             self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
 
-    # ==============================================================================
-    # -- Navigation functions -------------------------------------------------------
-    # ==============================================================================
-
-    def total_distance(self, current_plan):
-        sum = 0
-        for i in range(len(current_plan) - 1):
-            sum = sum + self.distance_wp(current_plan[i + 1][0], current_plan[i][0])
-        return sum
-
-    def distance_wp(self, target, current):
-        dx = target.transform.location.x - current.transform.location.x
-        dy = target.transform.location.y - current.transform.location.y
-        return math.sqrt(dx * dx + dy * dy)
-
-    def distance_goal(self, target, current):
-        dx = target.location.x - current.x
-        dy = target.location.y - current.y
-        return math.sqrt(dx * dx + dy * dy)
-
-    def distance_vehicle(self, waypoint, vehicle_transform):
-        loc = vehicle_transform.location
-        dx = waypoint.transform.location.x - loc.x
-        dy = waypoint.transform.location.y - loc.y
-
-        return math.sqrt(dx * dx + dy * dy)
-
-    def draw_path(self, world, current_plan):
-        for i in range(len(current_plan) - 1):
-            w1 = current_plan[i][0]
-            w2 = current_plan[i + 1][0]
-            self.world.debug.draw_line(w1.transform.location, w2.transform.location, thickness=0.5,
-                                       color=green, life_time=30.0)
-        self.draw_waypoint_info(world, current_plan[-1][0])
-
-    def draw_waypoint_info(self, world, w, lt=30):
-        w_loc = w.transform.location
-        world.debug.draw_point(w_loc, 0.5, red, lt)
-
-    # ==============================================================================

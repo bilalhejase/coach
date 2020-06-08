@@ -16,6 +16,20 @@ import pygame
 from matplotlib.path import Path
 import skimage
 
+# ==============================================================================
+# -- Get colors for debugging --------------------------------------------------
+# ==============================================================================
+
+red = carla.Color(255, 0, 0)
+green = carla.Color(0, 255, 0)
+blue = carla.Color(47, 210, 231)
+cyan = carla.Color(0, 255, 255)
+yellow = carla.Color(255, 255, 0)
+orange = carla.Color(255, 162, 0)
+white = carla.Color(255, 255, 255)
+
+# ==============================================================================
+
 def draw_waypoints(world, waypoints, z=0.5):
     """
     Draw a list of waypoints at a certain height given in z.
@@ -276,3 +290,41 @@ def vector(location_1, location_2):
 
     return [x / norm, y / norm, z / norm]
 
+# ==============================================================================
+# -- Navigation functions -------------------------------------------------------
+# ==============================================================================
+
+def total_distance(current_plan):
+  sum = 0
+  for i in range(len(current_plan) - 1):
+    sum = sum + distance_wp(current_plan[i + 1][0], current_plan[i][0])
+  return sum
+
+def distance_wp(target, current):
+  dx = target.transform.location.x - current.transform.location.x
+  dy = target.transform.location.y - current.transform.location.y
+  return math.sqrt(dx * dx + dy * dy)
+
+def distance_goal(target, current):
+  dx = target.location.x - current.x
+  dy = target.location.y - current.y
+  return math.sqrt(dx * dx + dy * dy)
+
+def distance_vehicle(waypoint, vehicle_transform):
+  loc = vehicle_transform.location
+  dx = waypoint.transform.location.x - loc.x
+  dy = waypoint.transform.location.y - loc.y
+
+  return math.sqrt(dx * dx + dy * dy)
+
+def draw_path(world, current_plan):
+  for i in range(len(current_plan) - 1):
+    w1 = current_plan[i][0]
+    w2 = current_plan[i + 1][0]
+    world.debug.draw_line(w1.transform.location, w2.transform.location, thickness=0.5,
+                               color=green, life_time=30.0)
+  draw_waypoint_info(world, current_plan[-1][0])
+
+def draw_waypoint_info(world, w, lt=30):
+  w_loc = w.transform.location
+  world.debug.draw_point(w_loc, 0.5, red, lt)
