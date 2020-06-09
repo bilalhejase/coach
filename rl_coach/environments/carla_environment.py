@@ -104,7 +104,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.dt = 0.1  # time interval between two frames
         self.max_ego_spawn_times = 200 # maximum times to spawn ego vehicle
         self.max_time_episode = 500 # maximum `timestep`s per episode
-        self.max_waypt = 12 # maximum number of waypoints
+        self.max_waypt = 20 # maximum number of waypoints
 
         self.default_input_filter = CarlaInputFilter
         self.default_output_filter = CarlaOutputFilter
@@ -176,7 +176,10 @@ class CarlaEnvironment(Environment):
         print('connecting to Carla server...')
         self.client = carla.Client(self.host, self.port)
         self.client.set_timeout(self.timeout)
+        # self.traffic_manager = self.client.get_trafficmanager(8001)
         self.traffic_manager = self.client.get_trafficmanager()
+        # tm_port = self.traffic_manager.get_port()
+
         self.world = self.client.load_world(level)
         print('Carla server connected!')
 
@@ -251,6 +254,8 @@ class CarlaEnvironment(Environment):
 
         self.reset_internal_state(True)
 
+        self.all_id = []
+        self.all_actors = []
 
 
     def _update_state(self):
@@ -356,15 +361,16 @@ class CarlaEnvironment(Environment):
         # Spawn pedestrians
         random.shuffle(self.walker_spawn_points)
         count = self.number_of_walkers
-        if count > 0:
-            for spawn_point in self.walker_spawn_points:
-                if self._try_spawn_random_walker_at(spawn_point):
-                    count -= 1
-                if count <= 0:
-                    break
-        while count > 0:
-            if self._try_spawn_random_walker_at(random.choice(self.walker_spawn_points)):
-                count -= 1
+        self._try_spawn_random_walker_at(self.walker_spawn_points)
+        # if count > 0:
+        #     for spawn_point in self.walker_spawn_points:
+        #         if self._try_spawn_random_walker_at(spawn_point):
+        #             count -= 1
+        #         if count <= 0:
+        #             break
+        # while count > 0:
+        #     if self._try_spawn_random_walker_at(random.choice(self.walker_spawn_points)):
+        #         count -= 1
 
         # Get actors polygon list
         self.vehicle_polygons = []
@@ -580,32 +586,104 @@ class CarlaEnvironment(Environment):
             return True
         return False
 
-    def _try_spawn_random_walker_at(self, transform):
-        """Try to spawn a walker at specific transform with random bluprint.
+    def _try_spawn_random_walker_at(self, spawn_points):
+        batch = []
+        walker_speed = []
+        walkers_list = []
+        self.all_id = []
+        SpawnActor = carla.command.SpawnActor
+        for spawn_point in spawn_points:
+            walker_bp = random.choice(self.world.get_blueprint_library().filter('walker.*'))
+            # set as not invincible
+            if walker_bp.has_attribute('is_invincible'):
+                walker_bp.set_attribute('is_invincible', 'false')
+            # set the max speed
+            if walker_bp.has_attribute('speed'):
+                if (random.random() > 0.5):
+                # if (random.random() > percentagePedestriansRunning):
+                    # walking
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[1])
+                else:
+                    # running
+                    walker_speed.append(walker_bp.get_attribute('speed').recommended_values[2])
+            else:
+                print("Walker has no speed")
+                walker_speed.append(0.0)
+            batch.append(SpawnActor(walker_bp, spawn_point))
+        results = self.client.apply_batch_sync(batch, True)
+        walker_speed2 = []
+        for i in range(len(results)):
+            if results[i].error:
+                logging.error(results[i].error)
+            else:
+                walkers_list.append({"id": results[i].actor_id})
+                walker_speed2.append(walker_speed[i])
+        walker_speed = walker_speed2
+        #
+        # 3. we spawn the walker controller
+        batch = []
+        walker_controller_bp = self.world.get_blueprint_library().find('controller.ai.walker')
+        for i in range(len(walkers_list)):
+            batch.append(SpawnActor(walker_controller_bp, carla.Transform(), walkers_list[i]["id"]))
+        results = self.client.apply_batch_sync(batch, True)
+        for i in range(len(results)):
+            if results[i].error:
+                logging.error(results[i].error)
+            else:
+                walkers_list[i]["con"] = results[i].actor_id
+        # 4. we put altogether the walkers and controllers id to get the objects from their id
+        for i in range(len(walkers_list)):
+            self.all_id.append(walkers_list[i]["con"])
+            self.all_id.append(walkers_list[i]["id"])
+        self.all_actors = self.world.get_actors(self.all_id)
 
-        Args:
-          transform: the carla transform object.
+        # wait for a tick to ensure client receives the last transform of the walkers we have just created
+        # self.world.wait_for_tick()
 
-        Returns:
-          Bool indicating whether the spawn is successful.
-        """
-        walker_bp = random.choice(self.world.get_blueprint_library().filter('walker.*'))
-        # set as not invencible
-        if walker_bp.has_attribute('is_invincible'):
-            walker_bp.set_attribute('is_invincible', 'false')
-        walker_actor = self.world.try_spawn_actor(walker_bp, transform)
+        self.world.set_pedestrians_cross_factor(0.5) # percentagePedestriansCrossing
 
-        if walker_actor is not None:
-            walker_controller_bp = self.world.get_blueprint_library().find('controller.ai.walker')
-            walker_controller_actor = self.world.spawn_actor(walker_controller_bp, carla.Transform(), walker_actor)
+        # 5. initialize each controller and set target to walk to (list is [controller, actor, controller, actor ...])
+        for i in range(0, len(self.all_id), 2):
             # start walker
-            walker_controller_actor.start()
+            self.all_actors[i].start()
             # set walk to random point
-            walker_controller_actor.go_to_location(self.world.get_random_location_from_navigation())
+            self.all_actors[i].go_to_location(self.world.get_random_location_from_navigation())
+            # max speed
+            self.all_actors[i].set_max_speed(float(walker_speed[int(i/2)]))
             # random max speed
-            walker_controller_actor.set_max_speed(1 + random.random())    # max speed between 1 and 2 (default is 1.4 m/s)
-            return True
-        return False
+            # self.all_actors[i].set_max_speed(1 + random.random())    # max speed between 1 and 2 (default is 1.4 m/s)
+
+
+    # def _try_spawn_random_walker_at(self, transform):
+    #     """Try to spawn a walker at specific transform with random blueprint.
+    #
+    #     Args:
+    #       transform: the carla transform object.
+    #
+    #     Returns:
+    #       Bool indicating whether the spawn is successful.
+    #     """
+    #     SpawnActor = carla.command.SpawnActor
+    #
+    #     walker_bp = random.choice(self.world.get_blueprint_library().filter('walker.*'))
+    #     # set as not invencible
+    #     if walker_bp.has_attribute('is_invincible'):
+    #         walker_bp.set_attribute('is_invincible', 'false')
+    #     # walker_actor = self.world.try_spawn_actor(walker_bp, transform)
+    #     walker_actor = SpawnActor(walker_bp, transform)
+    #
+    #     if walker_actor is not None:
+    #         walker_controller_bp = self.world.get_blueprint_library().find('controller.ai.walker')
+    #         walker_controller_actor = SpawnActor(walker_controller_bp, carla.Transform(), walker_actor)
+    #         # walker_controller_actor = self.world.spawn_actor(walker_controller_bp, carla.Transform(), walker_actor)
+    #         # start walker
+    #         walker_controller_actor.start()
+    #         # set walk to random point
+    #         walker_controller_actor.go_to_location(self.world.get_random_location_from_navigation())
+    #         # random max speed
+    #         walker_controller_actor.set_max_speed(1 + random.random())    # max speed between 1 and 2 (default is 1.4 m/s)
+    #         return True
+    #     return False
 
     def _try_spawn_ego_vehicle_at(self, transform):
         """Try to spawn the ego vehicle at specific transform.
@@ -835,7 +913,15 @@ class CarlaEnvironment(Environment):
 
     def _clear_all_actors(self, actor_filters):
         """Clear specific actors."""
-        for actor_filter in actor_filters:
-            actor_list = self.world.get_actors().filter(actor_filter)
-            self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
+        # for actor_filter in actor_filters:
+        #     actor_list = self.world.get_actors().filter(actor_filter)
+        #     self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
 
+        for actor_filter in actor_filters:
+            # actor_list = self.world.get_actors().filter(actor_filter)
+            # self.client.apply_batch([carla.command.DestroyActor(x) for x in actor_list])
+            for actor in self.world.get_actors().filter(actor_filter):
+                if actor.is_alive:
+                    if actor.type_id == 'controller.ai.walker':
+                        actor.stop()
+                    actor.destroy()
