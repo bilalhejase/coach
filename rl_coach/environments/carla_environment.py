@@ -72,7 +72,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.port = 2000
         self.timeout = 10.0 # Carla client timeout
         self.level = 'Town03' # Name of the world
-        self.number_of_vehicles = 5 # traffic
+        self.number_of_vehicles = 0 # traffic
         self.number_of_walkers = 0 # pedestrian traffic
         self.weather_id = 1 # Weather IDs: https://carla.readthedocs.io/en/stable/carla_settings/
 
@@ -83,7 +83,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.display_route = True # whether to render the desired route
         self.render_pygame = True # whether to render the pygame window
         # Example of adding sensors: self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.LIDAR]
-        self.sensors = [SensorTypes.FRONT_CAMERA, SensorTypes.SEMANTIC, SensorTypes.LIDAR, SensorTypes.BIRDEYE] # defines a list of sensors for the state space
+        self.sensors = [] # defines a list of sensors for the state space
         self.rgb_camera_height = 256
         self.rgb_camera_width = 256
         self.semseg_camera_height = 256
@@ -103,7 +103,7 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.max_past_step = 1 # the number of past steps to draw
         self.dt = 0.1  # time interval between two frames
         self.max_ego_spawn_times = 200 # maximum times to spawn ego vehicle
-        self.max_time_episode = 500 # maximum `timestep`s per episode
+        self.max_time_episode = 300 # maximum `timestep`s per episode
         self.max_waypt = 12 # maximum number of waypoints
 
         self.default_input_filter = CarlaInputFilter
@@ -337,7 +337,7 @@ class CarlaEnvironment(Environment):
         self.semseg_camera_sensor = None
 
         # Delete sensors, vehicles and walkers
-        self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'sensor.camera.semantic_segmentation' 'vehicle.*', 'controller.ai.walker', 'walker.*'])
+        self._clear_all_actors(['sensor.other.collision', 'sensor.lidar.ray_cast', 'sensor.camera.rgb', 'sensor.camera.semantic_segmentation', 'vehicle.*', 'controller.ai.walker', 'walker.*'])
 
         # Disable sync mode
         self._set_synchronous_mode(False)
