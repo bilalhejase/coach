@@ -95,8 +95,8 @@ class CarlaEnvironmentParameters(EnvironmentParameters):
         self.desired_speed = 8 # desired speed (m/s)
 
         self.discrete = True # whether to use discrete control space
-        self.discrete_acc = [-3.0, -1.5, 0.0, 1.5, 3.0] # discrete value of accelerations
-        self.discrete_steer = [-0.9, -0.5, -0.2, 0.0, 0.2, 0.5, 0.9] # discrete value of steering angles
+        self.discrete_acc = [3.0] # discrete value of accelerations
+        self.discrete_steer = [0.0] # discrete value of steering angles
         self.continuous_accel_range = [-3.0, 3.0]  # continuous acceleration range
         self.continuous_steer_range = [-0.3, 0.3]  # continuous steering angle range
 
@@ -287,11 +287,12 @@ class CarlaEnvironment(Environment):
           self.walker_polygons.pop(0)
 
         # route planner
-        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+        self.waypoints, _, self.navigation_command, _, self.vehicle_front = self.routeplanner.run_step()
 
         # state information
         info = {
           'waypoints': self.waypoints,
+          'navigation_command': self.navigation_command,
           'vehicle_front': self.vehicle_front
         }
 
@@ -440,7 +441,7 @@ class CarlaEnvironment(Environment):
         self.world.tick()
 
         self.routeplanner = RoutePlanner(self.ego, self.max_waypt)
-        self.waypoints, _, self.vehicle_front = self.routeplanner.run_step()
+        self.waypoints, _, self.navigation_command, _, self.vehicle_front = self.routeplanner.run_step()
 
         # Set ego information for render
         self.birdeye_render.set_hero(self.ego, self.ego.id)
@@ -473,6 +474,8 @@ class CarlaEnvironment(Environment):
         """Initialize the birdeye view renderer.
         """
         pygame.init()
+        pygame.font.init()
+        self.font = pygame.font.SysFont('Arial', 20)
         self.display = pygame.display.set_mode(
         (self.display_size * 4, self.display_size),
         pygame.HWSURFACE | pygame.DOUBLEBUF)
@@ -679,6 +682,11 @@ class CarlaEnvironment(Environment):
             self.birdeye = birdeye
             birdeye_surface = rgb_to_display_surface(birdeye, self.display_size)
             self.display.blit(birdeye_surface, (0, 0))
+
+            # Display high-level navigation command
+            textsurface = self.font.render(str(self.navigation_command), False, (255, 0, 0))
+            self.display.blit(textsurface, (0, 0))
+
 
             # Display lidar image
             if SensorTypes.LIDAR in self.sensors:

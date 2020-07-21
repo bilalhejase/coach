@@ -15,7 +15,7 @@ import random
 import numpy as np
 import carla
 
-from rl_coach.environments.carla.misc import distance_vehicle, is_within_distance_ahead, compute_magnitude_angle
+from rl_coach.environments.carla.misc import distance_vehicle, is_within_distance_ahead, compute_magnitude_angle, signal
 
 class RoadOption(Enum):
   """
@@ -83,10 +83,10 @@ class RoutePlanner():
       self._waypoints_queue.append((next_waypoint, road_option))
 
   def run_step(self):
-    waypoints = self._get_waypoints()
+    waypoints, target_road_option, command = self._get_waypoints()
     red_light, vehicle_front = self._get_hazard()
     # red_light = False
-    return waypoints, red_light, vehicle_front
+    return waypoints, target_road_option, command, red_light, vehicle_front
 
   def _get_waypoints(self):
     """
@@ -131,7 +131,10 @@ class RoutePlanner():
       for i in range(max_index - 1):
         self._waypoint_buffer.popleft()
 
-    return waypoints
+    next_target_waypoint, _ = self._waypoint_buffer[1]
+    command = retrieve_command(next_target_waypoint, self._target_waypoint, self._current_waypoint)
+
+    return waypoints, self._target_road_option, command
 
   def _get_hazard(self):
     # retrieve relevant elements for safe navigation, i.e.: traffic lights
@@ -232,6 +235,25 @@ class RoutePlanner():
           self._last_traffic_light = None
 
     return False
+
+def retrieve_command(next_next_waypoint, next_waypoint, current_waypoint):
+    command = RoadOption.LANEFOLLOW
+
+    if current_waypoint.is_junction:
+        print("we're in a junction")
+        past_to_current = np.array(
+            [next_waypoint.transform.location.x - current_waypoint.transform.location.x, next_waypoint.transform.location.y - current_waypoint.transform.location.y])
+        current_to_future = np.array(
+            [next_next_waypoint.transform.location.x - next_waypoint.transform.location.x, next_next_waypoint.transform.location.y - next_waypoint.transform.location.y])
+        angle = signal(current_to_future, past_to_current)
+        if angle < -0.1:
+            command = RoadOption.LEFT
+        elif angle > 0.1:
+            command = RoadOption.RIGHT
+        else:
+            command = RoadOption.STRAIGHT
+
+    return command
 
 def retrieve_options(list_waypoints, current_waypoint):
   """

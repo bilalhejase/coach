@@ -210,7 +210,9 @@ def distance_vehicle(waypoint, vehicle_transform):
 
   return math.sqrt(dx * dx + dy * dy)
 
-
+def signal(v1, v2):
+    return np.cross(v1, v2) / np.linalg.norm(v1) / np.linalg.norm(v2)
+    
 def set_carla_transform(pose):
   """
   Get a carla transform object given pose.
@@ -248,4 +250,3 @@ def rgb_to_display_surface(rgb, display_size):
   display = np.rot90(display, 1)
   pygame.surfarray.blit_array(surface, display)
   return surface
-
